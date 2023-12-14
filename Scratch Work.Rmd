@@ -1,0 +1,1060 @@
+---
+title: "Scratch Work"
+author: "Dav King"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r Libraries and Data}
+library(tidyverse)
+library(readr)
+library(GGally)
+library(corrplot)
+library(MASS)
+
+data <- read_delim("data.csv", delim = "\t", 
+                   escape_double = FALSE, trim_ws = TRUE)
+```
+
+# EDA
+
+## Preliminary Transformations
+
+```{r Preliminary Transformations}
+data <- data %>% 
+  mutate(stress_score = Q1A + Q6A + Q8A + Q11A + Q12A + Q14A + Q18A + 
+           Q22A + Q27A + Q29A + Q32A + Q33A + Q35A + Q39A,
+         anxiety_score = Q2A + Q4A + Q7A + Q9A + Q15A + Q19A + Q20A +
+           Q23A + Q25A + Q28A + Q30A + Q36A + Q40A + Q41A,
+         depression_score = Q3A + Q5A + Q10A + Q13A + Q16A + Q17A + Q21A + 
+           Q24A + Q26A + Q31A + Q34A + Q37A + Q38A + Q42A) %>% 
+  mutate(stress_score = stress_score - 14, # Original responses are based on 0-3 scale
+         anxiety_score = anxiety_score - 14, # Dataset is based on 1-4 scale
+         depression_score = depression_score - 14) %>% # 14 questions per scale
+  mutate(stress_cat = case_when(
+    stress_score <= 14 ~ "Normal",
+    stress_score <= 18 ~ "Mild",
+    stress_score <= 25 ~ "Moderate",
+    stress_score <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ), anxiety_cat = case_when(
+    anxiety_score <= 7 ~ "Normal",
+    anxiety_score <= 9 ~ "Mild",
+    anxiety_score <= 14 ~ "Moderate",
+    anxiety_score <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ), depression_cat = case_when(
+    depression_score <= 9 ~ "Normal",
+    depression_score <= 13 ~ "Mild",
+    depression_score <= 20 ~ "Moderate",
+    depression_score <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(stress_cat = factor(stress_cat,
+                             levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")),
+         anxiety_cat = factor(anxiety_cat,
+                              levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")),
+         depression_cat = factor(depression_cat,
+                                 levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")))
+```
+
+## EDA of Scales
+
+### Stress
+
+```{r Stress EDA}
+ggplot(data, aes(x = stress_score)) +
+  geom_histogram(color = "white", bins = length(unique(data$stress_score))) +
+  theme_bw() +
+  labs(x = "Stress Score", y = "Number of Responses", title = "Stress") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Approximately normally distributed, except for a disproportionate number of
+# responses at very top end of the scale - probably discard that one value,
+# shouldn't lose much information from that
+
+data %>% 
+  mutate(indicator = if_else(stress_score == max(stress_score), T, F)) %>% 
+  ggplot(aes(x = stress_score, fill = indicator)) +
+  geom_histogram(color = "white", bins = length(unique(data$stress_score))) +
+  theme_bw() +
+  labs(x = "Stress Score", y = "Number of Responses", title = "Stress") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_manual(values = c("gray40", "red")) +
+  guides(fill = F)
+
+data %>% 
+  group_by(stress_cat) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = stress_cat, y = n)) +
+  geom_col() +
+  theme_bw() +
+  labs(x = "Stress Category", y = "Number of Responses",
+       title = "Stress Categories") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+data %>% 
+  group_by(stress_cat) %>% 
+  summarize(n = n())
+
+# Fairly reasonable, although definitely higher severity than you would expect to find in the wild. Overall, Normal is the highest (~1.5x as high as next highest category). Maybe not a bad thing that we have a disproportionate dataset to train on!
+```
+
+### Anxiety
+
+```{r Anxiety EDA}
+ggplot(data, aes(x = anxiety_score)) +
+  geom_histogram(color = "white", bins = length(unique(data$anxiety_score))) +
+  theme_bw() +
+  labs(x = "Anxiety Score", y = "Number of Responses", title = "Anxiety") +
+  theme(plot.title = element_text(hjust = 0.5))
+# More reasonable - some right skew, clustered at lower values. Again, probably need to 
+# eliminate those responses at the singular highest value
+
+data %>% 
+  mutate(indicator = if_else(anxiety_score == max(anxiety_score), T, F)) %>% 
+  ggplot(aes(x = anxiety_score, fill = indicator)) +
+  geom_histogram(color = "white", bins = length(unique(data$anxiety_score))) +
+  theme_bw() +
+  labs(x = "Anxiety Score", y = "Number of Responses", title = "Anxiety") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_manual(values = c("gray40", "red")) +
+  guides(fill = F)
+
+data %>% 
+  group_by(anxiety_cat) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = anxiety_cat, y = n)) +
+  geom_col() +
+  theme_bw() +
+  labs(x = "Anxiety Category", y = "Number of Responses",
+       title = "Anxiety Categories") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+data %>% 
+  group_by(anxiety_cat) %>% 
+  summarize(n = n())
+
+# We're definitely skewing high here - "Extremely Severe" is definitely the largest category here. The cutoff values listed online (https://www.psytoolkit.org/survey-library/depression-anxiety-stress-dass.html) seem somewhat low to me.
+```
+
+### Depression
+
+```{r Depression EDA}
+ggplot(data, aes(x = depression_score)) +
+  geom_histogram(color = "white", bins = length(unique(data$depression_score))) +
+  theme_bw() +
+  labs(x = "Depression Score", y = "Number of Responses", title = "Depression") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Practically a uniform distribution, except for (again) that highest possible value (which will be discarded).
+
+data %>% 
+  mutate(indicator = if_else(depression_score == max(depression_score), T, F)) %>% 
+  ggplot(aes(x = depression_score, fill = indicator)) +
+  geom_histogram(color = "white", bins = length(unique(data$depression_score))) +
+  theme_bw() +
+  labs(x = "Depression Score", y = "Number of Responses", title = "Depression") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_manual(values = c("gray40", "red")) +
+  guides(fill = F)
+
+data %>% 
+  group_by(depression_cat) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = depression_cat, y = n)) +
+  geom_col() +
+  theme_bw() +
+  labs(x = "Depression Category", y = "Number of Responses",
+       title = "Depression Categories") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+data %>% 
+  group_by(depression_cat) %>% 
+  summarize(n = n())
+
+# Again, a major skew into extremely severe category. This might be a problem - that's not what you'd expect to see out in the world.
+
+data %>% 
+  filter(depression_score != max(depression_score)) %>% 
+  group_by(depression_cat) %>% 
+  summarize(n = n())
+
+# Still skewed when you remove those outlier responses, but not as much.
+```
+
+
+### Combinations
+
+```{r EDA Combinations}
+data %>% 
+  select(stress_score, anxiety_score, depression_score) %>% 
+  ggpairs() +
+  theme_bw()
+
+# Those are some insane correlations - to the point where I'm worried we even measure anything valid here. I may use this data regardless, but woah.
+```
+
+### BoxCox
+
+```{r EDA BoxCox}
+boxcox(lm(data$stress_score[data$stress_score > 0] ~ 1))
+stress_boxcox <- boxcox(lm(data$stress_score[data$stress_score > 0] ~ 1))
+best_stress <- stress_boxcox$x[which.max(stress_boxcox$y)] # Closer to 1 than 0 (0.79)
+best_stress
+par(mfrow = c(1, 2))
+hist(data$stress_score)
+hist(sqrt(data$stress_score)) # I think this is notably worse
+data <- data %>% 
+  mutate(stress_trans = (stress_score^best_stress - 1) / best_stress)
+par(mfrow = c(1, 2))
+hist(data$stress_score)
+hist(data$stress_trans) # Looks reasonably normal
+
+
+boxcox(lm(data$anxiety_score[data$anxiety_score > 0] ~ 1))
+anxiety_boxcox <- boxcox(lm(data$anxiety_score[data$anxiety_score > 0] ~ 1))
+best_anxiety <- anxiety_boxcox$x[which.max(anxiety_boxcox$y)] # Close to 0.5, suggests sqrt transformation
+best_anxiety
+par(mfrow = c(1, 2))
+hist(data$anxiety_score)
+hist(sqrt(data$anxiety_score)) # I mean it's so much better, still not the dream
+data <- data %>% 
+  mutate(anxiety_trans = (anxiety_score^best_anxiety - 1) / best_anxiety)
+par(mfrow = c(1, 2))
+hist(data$anxiety_score)
+hist(data$anxiety_trans) # Not a notable improvement
+
+
+boxcox(lm(data$depression_score[data$depression_score > 0] ~ 1))
+depression_boxcox <- boxcox(lm(data$depression_score[data$depression_score > 0] ~ 1))
+best_depression <- depression_boxcox$x[which.max(depression_boxcox$y)] # Closer to 0.5 than 1 (0.71), maybe try both untransformed and square root? 
+best_depression
+par(mfrow = c(1, 2))
+hist(data$depression_score)
+hist(sqrt(data$depression_score)) # Neither is normal at all
+data <- data %>% 
+  mutate(depression_trans = (depression_score^best_depression - 1) / best_depression)
+par(mfrow = c(1, 2))
+hist(data$depression_score)
+hist(data$depression_trans) # Maybe a little more normal? Idk stil doesn't make much sense
+```
+
+We will probably consider both normal and boxcox transformed for stress, both normal and sqrt transformed for anxiety, and all three possibilities for depression
+
+## Other Considerations
+
+### Country
+
+```{r Countries}
+data %>% 
+  group_by(country) %>% 
+  summarize(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  head(15) %>% 
+  ggplot(aes(x = reorder(country, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(x = "Country", y = "Number of Responses")
+
+data %>% 
+  group_by(country) %>% 
+  summarize(n = n()) %>% 
+  arrange(desc(n))
+
+# Place your best bets for why Malaysia takes up the majority of my responses
+
+big_countries <- c("MY", "US", "GB", "CA", "ID", "PH", "AU", "NONE")
+
+data <- data %>% 
+  mutate(country_simp = if_else(country %in% big_countries, country, "Other"))
+
+data %>% 
+  group_by(stress_cat, country_simp) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = stress_cat, y = n)) +
+  geom_col() +
+  facet_wrap(~country_simp, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Stress Category", y = "Number of Responses",
+       title = "Stress Categories by Country") +
+  theme(plot.title = element_text(hjust = 0.5))
+# No real deviations by country, which is encouraging
+
+data %>% 
+  group_by(anxiety_cat, country_simp) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = anxiety_cat, y = n)) +
+  geom_col() +
+  facet_wrap(~country_simp, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Anxiety Category", y = "Number of Responses",
+       title = "Anxiety Categories by Country") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Same, except slight difference in Philippines
+
+data %>% 
+  group_by(depression_cat, country_simp) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = depression_cat, y = n)) +
+  geom_col() +
+  facet_wrap(~country_simp, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Depression Category", y = "Number of Responses",
+       title = "Depression Categories by Country") +
+  theme(plot.title = element_text(hjust = 0.5))
+# There definitely feel like differences in categories here
+
+chisq.test(table(data$depression_cat, data$country_simp))
+# Substantial differences by country (the others do too, but less)
+```
+
+### Personality
+
+```{r EDA Personality}
+data <- data %>% 
+  mutate(extraversion = if_else(TIPI1 == 0, NA, TIPI1) +
+           (8 - if_else(TIPI6 == 0, NA, TIPI6)),
+         agreeableness = (8 - if_else(TIPI2 == 0, NA, TIPI2)) + 
+           if_else(TIPI7 == 0, NA, TIPI7),
+         conscientiousness = if_else(TIPI3 == 0, NA, TIPI3) +
+           (8 - if_else(TIPI8 == 0, NA, TIPI8)),
+         emotional_stability = (8 - if_else(TIPI4 == 0, NA, TIPI4)) +
+           if_else(TIPI9 == 0, NA, TIPI9),
+         openness = if_else(TIPI5 == 0, NA, TIPI5) +
+           (8 - if_else(TIPI10 == 0, NA, TIPI10)))
+
+data %>% 
+  select(extraversion, agreeableness, conscientiousness,
+         emotional_stability, openness) %>% 
+  pivot_longer(everything(), names_to = "Trait") %>% 
+  filter(value != 15) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(color = "white", bins = 13) +
+  facet_wrap(~Trait, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Score", y = "Number of Responses",
+       title = "Distribution of Personality Traits") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Note on data cleaning: Some of these responses have value 0, which should not be the case. May want to look into potential issues there.
+
+# Note on distributions: I think emotional stability, extraversion, and maybe even openness should be more normally distributed. However, it doesn't suck too bad.
+
+data %>% 
+  select(extraversion, agreeableness, conscientiousness,
+         emotional_stability, openness) %>% 
+  ggpairs() +
+  theme_bw()
+# Highest correlation = emotional stability x conscientiousness, 0.284
+# However, they are all significant except for agreeableness x extraversion (really?)
+```
+
+### Demographics
+
+#### Education
+
+```{r EDA Education}
+data <- data %>% 
+  mutate(education = case_when(
+    education == 1 ~ "Less than high school",
+    education == 2 ~ "High school",
+    education == 3 ~ "University degree",
+    education == 4 ~ "Graduate degree",
+    T ~ "Unknown"
+  )) %>% 
+  mutate(education = factor(education,
+                            levels = c("Unknown", "Less than high school",
+                                       "High school", "University degree",
+                                       "Graduate degree")))
+
+data %>% 
+  group_by(education) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = education, y = n)) +
+  geom_col() +
+  theme_bw() +
+  labs(x = "Education", y = "Number of Responses")
+# Definitely skewed towards university degree, but good representation of just high school
+# Very little "less than high school", probably can't use this to justify a diagnostic tool for students
+
+data %>% 
+  group_by(education, country_simp) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = education, y = n)) +
+  geom_col() +
+  facet_wrap(~country_simp, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Education", y = "Number of Responses",
+       title = "Education by Country") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Obviously different by country, interestingly less educated in Western countries
+```
+
+#### Urban/Rural
+
+```{r EDA Urban}
+data <- data %>% 
+  mutate(urban = case_when(
+    urban == 1 ~ "Rural",
+    urban == 2 ~ "Suburban",
+    urban == 3 ~ "Urban",
+    T ~ "Unknown"
+  )) %>% 
+  mutate(urban = factor(urban, levels = c("Unknown", "Rural",
+                                          "Suburban", "Urban")))
+
+data %>% 
+  group_by(urban) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = urban, y = n)) +
+  geom_col() +
+  theme_bw() +
+  labs(x = "Childhood Upbringing", y = "Number of Responses")
+# Definitely skews urban, but at least it doesn't skew suburban
+# Urban is often a group that needs the diagnostics most (same with rural)
+```
+
+#### Age
+
+```{r EDA Age}
+data %>% 
+  filter(age < 100) %>% 
+  ggplot(aes(x = age)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Age", y = "Number of Responses")
+
+# Note: Some respondents either put their birth year instead or clearly lied/had a typo
+
+summary(data$age)
+# Skews very young but I don't mind
+```
+
+#### Religion
+
+```{r EDA Religion}
+data <- data %>% 
+  mutate(religion = case_when(
+    religion == 1 ~ "Agnostic",
+    religion == 2 ~ "Atheist",
+    religion == 3 ~ "Buddhist",
+    religion == 4 ~ "Christian (Catholic)",
+    religion == 5 ~ "Christian (Mormon)",
+    religion == 6 ~ "Christian (Protestant)",
+    religion == 7 ~ "Christian (Other)",
+    religion == 8 ~ "Hindu",
+    religion == 9 ~ "Jewish",
+    religion == 10 ~ "Muslim",
+    religion == 11 ~ "Sikh",
+    religion == 12 ~ "Other",
+    T ~ "Unknown"))
+
+data %>% 
+  group_by(religion) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = reorder(religion, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(x = "Religion", y = "Number of Responses")
+# HEAVY Muslim skew, relatively very few Christians
+
+data %>% 
+  group_by(stress_cat, religion) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = stress_cat, y = n)) +
+  geom_col() +
+  facet_wrap(~religion, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Stress Category", y = "Number of Responses", title = "Stress") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Honestly shockingly stable
+
+data %>% 
+  group_by(anxiety_cat, religion) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = anxiety_cat, y = n)) +
+  geom_col() +
+  facet_wrap(~religion, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Anxiety Category", y = "Number of Responses", title = "Anxiety") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Even more stable
+
+data %>% 
+  group_by(depression_cat, religion) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = depression_cat, y = n)) +
+  geom_col() +
+  facet_wrap(~religion, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Depression Category", y = "Number of Responses",
+       title = "Depression") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Notably less stable
+```
+
+## PCA
+
+```{r EDA PCA}
+DASS_subset <- data %>% 
+  select(starts_with("Q") & ends_with("A"))
+
+pca.1 <- prcomp(DASS_subset, scale = T)
+pca_var <- pca.1$sdev^2
+pca_var_pct <- pca_var / sum(pca_var)
+pca_var_pct # Only one meaningful principal component
+
+pca.1$rotation[,1]
+# Everything loads onto it almost the exact same amount
+
+pca.2 <- prcomp(DASS_subset, scale = T, rank. = 3)
+pca_var_2 <- pca.2$sdev^2
+pca_var_pct_2 <- pca_var_2 / sum(pca_var_2)
+pca_var_pct_2
+```
+
+## EDA of Predictors
+
+```{r EDA Qs Histograms}
+stress_qs <- c(1, 6, 8, 11, 12, 14, 18, 22, 27, 29, 32, 33, 35, 39)
+anxiety_qs <- c(2, 4, 7, 9, 15, 19, 20, 23, 25, 28, 30, 36, 40, 41)
+depression_qs <- c(3, 5, 10, 13, 16, 17, 21, 24, 26, 31, 34, 37, 38, 42)
+
+DASS_subset %>% 
+  pivot_longer(everything()) %>% 
+  mutate(name = str_remove_all(name, "[A-Z]")) %>% 
+  mutate(name = as.integer(name)) %>% 
+  mutate(scale = case_when(
+    name %in% stress_qs ~ "Stress",
+    name %in% anxiety_qs ~ "Anxiety",
+    name %in% depression_qs ~ "Depression",
+    T ~ NA
+  )) %>% 
+  ggplot(aes(x = value, fill = scale)) +
+  geom_bar() +
+  facet_wrap(~name) +
+  theme_bw() +
+  labs(x = "Score", y = "Number of Responses", 
+       title = "Histogram of Question Responses", fill = "Metric") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Stress: seems to be most frequently "2", generally pretty flat. Questions that deviate from usual pattern: 11, maybe 14
+
+# Anxiety: much more right-skewed (especially question 23), Q40 is of note (the only one that increases)
+
+# Depression: Much less uniform than their addition would have you think. Still highest values at "2", but some increase, some decrease, some are pretty much uniform
+```
+
+### Rank-Order Analysis
+
+```{r EDA Rank Order}
+data %>% 
+  select(starts_with("Q") & !ends_with("E")) %>% 
+  mutate(resp = row_number()) %>%
+  pivot_longer(cols = -resp) %>% 
+  mutate(type = str_split_i(name, "", -1),
+         name = str_split(name, "[AI]", simplify = T)[,1]) %>%
+  pivot_wider(names_from = type, values_from = value) %>% 
+  mutate(name = str_remove_all(name, "[A-Z]")) %>% 
+  mutate(name = as.integer(name)) %>% 
+  mutate(scale = case_when(
+    name %in% stress_qs ~ "Stress",
+    name %in% anxiety_qs ~ "Anxiety",
+    name %in% depression_qs ~ "Depression",
+    T ~ NA
+  )) %>% 
+  group_by(name, I, scale) %>% 
+  summarize(resp = mean(A)) %>% 
+  ggplot(aes(x = I, y = resp, color = scale)) +
+  geom_point() +
+  facet_wrap(~name) +
+  geom_smooth(method = "lm", color = "black", se = F, alpha = 0.5) +
+  theme_bw() +
+  labs(x = "Position in Survey", y = "Mean Response", color = "Scale",
+       title = "Does Position in Survey Affect Responses?") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+### Stress
+
+```{r EDA Stress Qs}
+stress_subset <- DASS_subset %>% 
+  select(Q1A, Q6A, Q8A, Q11A, Q12A, Q14A, Q18A, 
+           Q22A, Q27A, Q29A, Q32A, Q33A, Q35A, Q39A)
+
+#ggpairs(stress_subset) +
+  #theme_bw()
+
+corrplot.mixed(cor(stress_subset), lower = "shade", upper = "number")
+
+# Biggest correlations: Q1:Q11, Q8:Q22, Q11:Q27, Q11:Q29, Q12:Q33, Q27:Q39
+# Smallest correlations: Q12:Q14, Q14:Q33, Q14:Q18, Q14:Q33
+
+colSums(cor(stress_subset))
+# Q14 and Q18 are least correlated with other variables
+```
+
+### Anxiety
+
+```{r EDA Anxiety Qs}
+anxiety_subset <- DASS_subset %>% 
+  select(Q2A, Q4A, Q7A, Q9A, Q15A, Q19A, Q20A,
+           Q23A, Q25A, Q28A, Q30A, Q36A, Q40A, Q41A)
+
+#ggpairs(anxiety_subset) +
+  #theme_bw()
+
+corrplot.mixed(cor(anxiety_subset), lower = "shade", upper = "number")
+# Generally seems lower across the board than stress did
+
+colSums(cor(anxiety_subset))
+# Q2 by far the least correlated with others, Q19 is also low
+```
+
+### Depression
+
+```{r EDA Depression Qs}
+depression_subset <- DASS_subset %>% 
+  select(Q3A, Q5A, Q10A, Q13A, Q16A, Q17A, Q21A, 
+           Q24A, Q26A, Q31A, Q34A, Q37A, Q38A, Q42A)
+
+#ggpairs(depression_subset) +
+  #theme_bw()
+
+corrplot.mixed(cor(depression_subset), lower = "shade", upper = "number")
+# Much higher correlations pretty much across the board - some as high as .8
+
+colSums(cor(depression_subset))
+# WAY higher than anxiety and stress, Q42 much lower than the rest
+```
+
+Possible concern: are all of these questions valid? We may have to *assume* that they are, but I'm not positive that some of these less-correlated variables are at all indicative of what they say they are.
+
+### Question Response Times
+
+```{r EDA Response Times}
+data %>% 
+  select(starts_with("Q") & ends_with("E")) %>% 
+  pivot_longer(everything()) %>% 
+  mutate(name = str_remove_all(name, "[A-Z]")) %>% 
+  mutate(name = as.integer(name)) %>% 
+  mutate(scale = case_when(
+    name %in% stress_qs ~ "Stress",
+    name %in% anxiety_qs ~ "Anxiety",
+    name %in% depression_qs ~ "Depression",
+    T ~ NA
+  )) %>% 
+  filter(value < quantile(value, .75) + 1.5 * median(value)) %>% 
+  filter(value > quantile(value, .25) - 1.5 * median(value)) %>% 
+  ggplot(aes(x = value, fill = scale)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~name) +
+  theme_bw() +
+  labs(x = "Time to Respond (ms)", y = "Number of Responses", 
+       title = "Histogram of Question Response Time", fill = "Metric") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Data has both left tails and extreme right tails, both filtered out for these responses
+
+# Generally fairly similar - I think the stress questions may actually be more peaked, and anxiety questions may be less peaked.
+
+data %>% 
+  select(starts_with("Q") & ends_with("E")) %>% 
+  pivot_longer(everything()) %>%
+  summary(value) # Why are there values less than 0?
+# Probably corresponds to questions answered out of order.
+```
+
+```{r EDA Mean Total Response}
+data %>% 
+  select(starts_with("Q") & ends_with("E")) %>% 
+  mutate(total_time = rowSums(.)) %>% 
+  mutate(total_time_s = total_time / 1000) %>% 
+  select(total_time_s) %>% 
+  summarize(mean(total_time_s)) %>% 
+  pull()
+```
+
+```{r EDA Time by Rank Order}
+data %>% 
+  select(starts_with("Q") & !ends_with("A")) %>% 
+  mutate(resp = row_number()) %>%
+  pivot_longer(cols = -resp) %>% 
+  mutate(type = str_split_i(name, "", -1),
+         name = str_split(name, "[EI]", simplify = T)[,1]) %>%
+  pivot_wider(names_from = type, values_from = value) %>% 
+  mutate(name = str_remove_all(name, "[A-Z]")) %>% 
+  mutate(name = as.integer(name)) %>% 
+  mutate(scale = case_when(
+    name %in% stress_qs ~ "Stress",
+    name %in% anxiety_qs ~ "Anxiety",
+    name %in% depression_qs ~ "Depression",
+    T ~ NA
+  )) %>% 
+  group_by(I, scale) %>% 
+  summarize(med_time = median(E)) %>% 
+  ggplot(aes(x = I, y = med_time, color = scale)) +
+  geom_point() +
+  facet_wrap(~scale, ncol = 1) +
+  geom_smooth(se = F) +
+  theme_bw() +
+  labs(x = "Position in Survey", y = "Median Response Time",
+       title = "Response Times Decrease Later in Survey") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+```
+
+
+
+# Very Exploratory Modeling
+
+## Stress
+
+### Stress Scale Predictors
+
+```{r Stress Modeling EDA}
+#summary(lm(stress_score ~ Q1A + Q6A + Q8A + Q11A + Q12A + Q14A + Q18A + 
+           #Q22A + Q27A + Q29A + Q32A + Q33A + Q35A + Q39A, data))
+
+summary(lm(stress_score ~ Q1A, data)) # Sig, 7.812
+summary(lm(stress_score ~ Q6A, data)) # Sig, 7.287
+summary(lm(stress_score ~ Q8A, data)) # Sig, 7.294
+summary(lm(stress_score ~ Q11A, data)) # Sig, 7.799
+summary(lm(stress_score ~ Q12A, data)) # Sig, 7.013
+summary(lm(stress_score ~ Q14A, data)) # Sig, 6.112
+summary(lm(stress_score ~ Q18A, data)) # Sig, 6.314
+summary(lm(stress_score ~ Q22A, data)) # Sig, 7.430
+summary(lm(stress_score ~ Q27A, data)) # Sig, 7.604
+summary(lm(stress_score ~ Q29A, data)) # Sig, 7.557
+summary(lm(stress_score ~ Q32A, data)) # Sig, 7.250
+summary(lm(stress_score ~ Q33A, data)) # Sig, 7.185
+summary(lm(stress_score ~ Q35A, data)) # Sig, 7.301
+summary(lm(stress_score ~ Q39A, data)) # Sig, 7.706
+# Overall: biggest = Q1A, Q11A; smallest = Q14A, Q18A
+```
+
+### Other Scale Predictors
+
+```{r Stress Modeling EDA 2}
+summary(lm(stress_score ~ anxiety_score + depression_score, data)) # Both sig, anxiety bigger estimate
+summary(lm(stress_score ~ anxiety_score, data)) # Sig, 0.824
+summary(lm(stress_score ~ depression_score, data)) # Sig, 0.632
+
+summary(lm(stress_score ~ Q2A + Q3A + Q4A + Q5A + Q7A + Q9A + Q10A + Q13A +
+             Q15A + Q16A + Q17A + Q19A + Q20A + Q21A + Q23A + Q24A + Q25A + 
+             Q26A + Q28A + Q30A + Q31A + Q34A + Q36A + Q37A + Q38A + Q40A +
+             Q41A + Q42A, data)) # Not significant: Q16A, Q21A, Q34A
+# Less significant: Q10A
+# Rsq = 0.7473, adj rsq = 0.7472, F(28, 39746) = 4199, p < .001
+plot(lm(stress_score ~ Q2A + Q3A + Q4A + Q5A + Q7A + Q9A + Q10A + Q13A +
+             Q15A + Q16A + Q17A + Q19A + Q20A + Q21A + Q23A + Q24A + Q25A + 
+             Q26A + Q28A + Q30A + Q31A + Q34A + Q36A + Q37A + Q38A + Q40A +
+             Q41A + Q42A, data))
+# Some trends in the residuals (they have clear diagonal trends), but technically speaking they do not violate the criteria except for very high and low values
+# Q-Q plot is honestly pretty good! Not quite on the diagonal but overall pretty straight line
+# Scale-location plot has some crazy trends in it but strictly speaking isn't terrible
+# Some residuals have high leverage but none of them are really concerning
+
+summary(lm(stress_score ~ Q10A, data)) # Sig, 5.218
+summary(lm(stress_score ~ Q16A, data)) # Sig, 5.490
+summary(lm(stress_score ~ Q21A, data)) # Sig, 5.314
+summary(lm(stress_score ~ Q34A, data)) # Sig, 5.546
+
+
+summary(lm(stress_score ~ Q9A + Q13A + Q28A + Q30A + Q40A, data)) # 5 biggest predictors
+# Rsq = 0.6874 = adj rsq, F(5, 39769) = 17490, p < .001
+# Everything significant, Q13A and then Q28A are the biggest predictors
+plot(lm(stress_score ~ Q9A + Q13A + Q28A + Q30A + Q40A, data))
+# Diagnostics are about the same as before, not much to worry about
+# This model explains 92% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 5 instead of 28 predictors. This is encouraging!
+```
+
+### Demographic Predictors
+
+```{r EDA Modeling Stress Dem}
+summary(lm(stress_score ~ education, data)) # Overall sig, rsq of like 0.02 tho
+summary(lm(stress_score ~ factor(orientation), data)) # Overall sig, again rsq of like 0.015
+summary(lm(stress_score ~ factor(race), data)) # Overall sig, rsq = 0.002
+summary(lm(stress_score ~ urban, data)) # Overall sig, rsq = 0.001
+summary(lm(stress_score ~ factor(gender), data)) # Overall sig, rsq = 0.02
+summary(lm(stress_score ~ age, data)) # Overall sig, rsq = 0.004
+summary(lm(stress_score ~ factor(voted), data)) # Overall sig, rsq = 0.01
+summary(lm(stress_score ~ factor(married), data)) # Overall sig, rsq = 0.01
+summary(lm(stress_score ~ familysize, data)) # Overall sig, rsq = 0.0009
+
+summary(lm(stress_score ~ education + factor(orientation) + factor(race) +
+             urban + factor(gender) + age + factor(voted) + factor(married) + 
+             familysize, data)) # Overall sig, rsq = 0.06
+# Only variables sig are education, orientation, race, age, voting, marriage, family size
+```
+
+### Personality
+
+```{r EDA Modeling Stress Personality}
+summary(lm(stress_score ~ extraversion, data)) # Sig, rsq = 0.03
+summary(lm(stress_score ~ agreeableness, data)) # Sig, rsq = 0.04
+summary(lm(stress_score ~ conscientiousness, data)) # Sig, rsq = 0.05
+summary(lm(stress_score ~ emotional_stability, data)) # Sig, rsq = 0.42 (not a typo)
+summary(lm(stress_score ~ openness, data)) # Sig, rsq = 0.04
+
+summary(lm(stress_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, data)) # Sig, rsq = 0.43 (might as well just use emotional stability / neuroticism)
+plot(lm(stress_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, data))
+# Assumptions slightly worse and patterns even more egregious, but overall not awful
+
+plot(lm(stress_score ~ emotional_stability, data))
+# Definite trends in the residuals
+```
+
+### Good Simple Model
+
+```{r EDA Modeling Stress Good Simple Model}
+summary(lm(stress_score ~ Q9A + Q13A + Q28A + Q30A + Q40A +
+             emotional_stability, data)) # Rsq = adj rsq = 0.7233, F(6, 39201) = 17080, p < .001
+# Substantial improvement when we throw in emotional stability as a predictor
+
+plot(lm(stress_score ~ Q9A + Q13A + Q28A + Q30A + Q40A +
+             emotional_stability, data))
+# Q-Q is somewhat sloppier but overall not the worst I've seen
+```
+
+## Anxiety
+
+### Anxiety Scale Predictors
+
+```{r EDA Modeling Anxiety}
+#summary(lm(anxiety_score ~ Q2A + Q4A + Q7A + Q9A + Q15A + Q19A + Q20A +
+           #Q23A + Q25A + Q28A + Q30A + Q36A + Q40A + Q41A, data))
+
+summary(lm(anxiety_score ~ Q2A, data)) # Sig, 5.255
+summary(lm(anxiety_score ~ Q4A, data)) # Sig, 7.143
+summary(lm(anxiety_score ~ Q7A, data)) # Sig, 7.379
+summary(lm(anxiety_score ~ Q9A, data)) # Sig, 6.746
+summary(lm(anxiety_score ~ Q15A, data)) # Sig, 6.945
+summary(lm(anxiety_score ~ Q19A, data)) # Sig, 5.952
+summary(lm(anxiety_score ~ Q20A, data)) # Sig, 6.833
+summary(lm(anxiety_score ~ Q23A, data)) # Sig, 7.456
+summary(lm(anxiety_score ~ Q25A, data)) # Sig, 6.549
+summary(lm(anxiety_score ~ Q28A, data)) # Sig, 7.296
+summary(lm(anxiety_score ~ Q30A, data)) # Sig, 6.369
+summary(lm(anxiety_score ~ Q36A, data)) # Sig, 6.867
+summary(lm(anxiety_score ~ Q40A, data)) # Sig, 6.552
+summary(lm(anxiety_score ~ Q41A, data)) # Sig, 7.013
+# Biggest: Q23A, Q7A
+# Smallest: Q2A, Q19A
+```
+
+### Other Scale Predictors
+
+```{r EDA Modeling Anxiety Other Scales}
+summary(lm(anxiety_score ~ stress_score + depression_score, data)) # Both sig, stress much bigger estimate
+summary(lm(anxiety_score ~ stress_score, data)) # Sig, 0.781
+summary(lm(anxiety_score ~ depression_score, data)) # Sig, 0.557
+
+summary(lm(anxiety_score ~ Q1A + Q3A + Q5A + Q6A + Q8A + Q10A + Q11A + Q12A +
+             Q13A + Q14A + Q16A + Q17A + Q18A + Q21A + Q22A + Q24A + Q26A +
+             Q27A + Q29A + Q31A + Q32A + Q33A + Q34A + Q35A + Q37A + Q38A +
+             Q39A + Q42A, data)) # Not significant: Q3A, Q5A, Q10A, Q11A, Q13A, Q24A, Q27A, Q42A
+# Less significant: Q26A, Q31A, Q37A, Q38A
+# Almost all of the less/not significant ones are from depression scale
+# Rsq = 0.704, adj rsq = 0.7037, F(28, 39746) = 3375, p < .001
+
+plot(lm(anxiety_score ~ Q1A + Q3A + Q5A + Q6A + Q8A + Q10A + Q11A + Q12A +
+             Q13A + Q14A + Q16A + Q17A + Q18A + Q21A + Q22A + Q24A + Q26A +
+             Q27A + Q29A + Q31A + Q32A + Q33A + Q34A + Q35A + Q37A + Q38A +
+             Q39A + Q42A, data))
+# More patterns in the residuals than before - may be too bad for meeting assumptions
+
+summary(lm(anxiety_score ~ Q3A, data)) # Sig, 5.236
+summary(lm(anxiety_score ~ Q5A, data)) # Sig, 5.165
+summary(lm(anxiety_score ~ Q10A, data)) # Sig, 4.638
+summary(lm(anxiety_score ~ Q11A, data)) # Sig, 5.714
+summary(lm(anxiety_score ~ Q13A, data)) # Sig, 5.615
+summary(lm(anxiety_score ~ Q24A, data)) # Sig, 5.086
+summary(lm(anxiety_score ~ Q27A, data)) # Sig, 5.431
+summary(lm(anxiety_score ~ Q42A, data)) # Sig, 4.746
+summary(lm(anxiety_score ~ Q26A, data)) # Sig, 5.411
+summary(lm(anxiety_score ~ Q31A, data)) # Sig, 4.973
+summary(lm(anxiety_score ~ Q37A, data)) # Sig, 4.538
+summary(lm(anxiety_score ~ Q38A, data)) # Sig, 4.592
+
+
+summary(lm(anxiety_score ~ Q33A + Q12A + Q29A + Q14A, data)) # 4 biggest predictors
+# Rsq = 0.6442, adj rsq = 0.6441, F(4, 39770) = 18000, p < .001
+# Everything significant, Q33A and then Q12A are the biggest predictors
+plot(lm(anxiety_score ~ Q33A + Q12A + Q29A + Q14A, data))
+# Diagnostics are about the same as before: still bad trends in residuals (pattern shouldn't be there)
+# This model explains 92% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 4 instead of 28 predictors. This is encouraging!
+```
+
+### Demographic Predictors
+
+```{r EDA Modeling Anxiety Dem}
+summary(lm(anxiety_score ~ education, data)) # Overall sig, rsq of like 0.03 tho
+summary(lm(anxiety_score ~ factor(orientation), data)) # Overall sig, again rsq of like 0.025
+summary(lm(anxiety_score ~ factor(race), data)) # Overall sig, rsq = 0.003
+summary(lm(anxiety_score ~ urban, data)) # Overall sig, rsq = 0.002
+summary(lm(anxiety_score ~ factor(gender), data)) # Overall sig, rsq = 0.02
+summary(lm(anxiety_score ~ age, data)) # Overall sig, rsq = 0.01
+summary(lm(anxiety_score ~ factor(voted), data)) # Overall sig, rsq = 0.02
+summary(lm(anxiety_score ~ factor(married), data)) # Overall sig, rsq = 0.03
+summary(lm(anxiety_score ~ familysize, data)) # Overall sig, rsq = 0.00001
+# Slightly more predictive than for stress, but still almost none
+
+summary(lm(anxiety_score ~ education + factor(orientation) + factor(race) +
+             urban + factor(gender) + age + factor(voted) + factor(married) + 
+             familysize, data)) # Overall sig, rsq = 0.09
+# Only variables sig are education, orientation, race, gender, age, voting, marriage
+```
+
+### Personality
+
+```{r EDA Modeling Anxiety Personality}
+summary(lm(anxiety_score ~ extraversion, data)) # Sig, rsq = 0.04
+summary(lm(anxiety_score ~ agreeableness, data)) # Sig, rsq = 0.01
+summary(lm(anxiety_score ~ conscientiousness, data)) # Sig, rsq = 0.06
+summary(lm(anxiety_score ~ emotional_stability, data)) # Sig, rsq = 0.29
+summary(lm(anxiety_score ~ openness, data)) # Sig, rsq = 0.04
+
+summary(lm(anxiety_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, data)) # Sig, rsq = 0.31
+plot(lm(anxiety_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, data))
+# Like it's not good
+
+plot(lm(anxiety_score ~ emotional_stability, data))
+# lol
+```
+
+### Good Simple Model
+
+```{r EDA Modeling Anxiety Good Simple Model}
+summary(lm(anxiety_score ~ Q33A + Q12A + Q29A + Q14A +
+             emotional_stability, data)) # Rsq = 0.6499, adj rsq = 0.6498, F(5, 39202) = 14550, p < .001
+# Not much improvement with emotional stability as a predictor
+
+plot(lm(anxiety_score ~ Q33A + Q12A + Q29A + Q14A +
+             emotional_stability, data))
+# Might be slightly better
+```
+
+
+## Depression
+
+### Depression Scale Predictors
+
+```{r EDA Modeling Anxiety}
+#summary(lm(depression_score ~ Q3A + Q5A + Q10A + Q13A + Q16A + Q17A + Q21A + 
+           #Q24A + Q26A + Q31A + Q34A + Q37A + Q38A + Q42A, data))
+
+summary(lm(depression_score ~ Q3A, data)) # Sig, 9.409
+summary(lm(depression_score ~ Q5A, data)) # Sig, 8.837
+summary(lm(depression_score ~ Q10A, data)) # Sig, 8.995
+summary(lm(depression_score ~ Q13A, data)) # Sig, 9.362
+summary(lm(depression_score ~ Q16A, data)) # Sig, 8.919
+summary(lm(depression_score ~ Q17A, data)) # Sig, 8.665
+summary(lm(depression_score ~ Q21A, data)) # Sig, 8.953
+summary(lm(depression_score ~ Q24A, data)) # Sig, 9.167
+summary(lm(depression_score ~ Q26A, data)) # Sig, 9.047
+summary(lm(depression_score ~ Q31A, data)) # Sig, 9.105
+summary(lm(depression_score ~ Q34A, data)) # Sig, 8.820
+summary(lm(depression_score ~ Q37A, data)) # Sig, 8.715
+summary(lm(depression_score ~ Q38A, data)) # Sig, 8.714
+summary(lm(depression_score ~ Q42A, data)) # Sig, 8.129
+# Biggest: Q3A, Q13A
+# Smallest: Q42A
+```
+
+### Other Scale Predictors
+
+```{r EDA Modeling Depression Other Scales}
+summary(lm(depression_score ~ stress_score + anxiety_score, data)) # Both sig, stress much bigger estimate
+summary(lm(depression_score ~ stress_score, data)) # Sig, 0.866
+summary(lm(depression_score ~ anxiety_score, data)) # Sig, 0.805
+
+summary(lm(depression_score ~ Q1A + Q2A + Q4A + Q6A + Q7A + Q8A + Q9A + Q11A +
+             Q12A + Q14A + Q15A + Q18A + Q19A + Q20A + Q22A + Q23A + Q25A + 
+             Q27A + Q28A + Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A +
+             Q40A + Q41A, data)) 
+# Not significant: Q4A, Q9A, Q19A, Q25A, Q41A
+# Less significant: Q7A, Q12A
+# Rsq = 0.6053, adj rsq = 0.605, F(28, 39746) = 2177, p < .001
+
+plot(lm(depression_score ~ Q1A + Q2A + Q4A + Q6A + Q7A + Q8A + Q9A + Q11A +
+             Q12A + Q14A + Q15A + Q18A + Q19A + Q20A + Q22A + Q23A + Q25A + 
+             Q27A + Q28A + Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A +
+             Q40A + Q41A, data))
+# Assumptions still slightly worse than for anxiety
+
+summary(lm(depression_score ~ Q4A, data)) # Sig, 5.232
+summary(lm(depression_score ~ Q9A, data)) # Sig, 5.695
+summary(lm(depression_score ~ Q19A, data)) # Sig, 4.071
+summary(lm(depression_score ~ Q25A, data)) # Sig, 4.735
+summary(lm(depression_score ~ Q41A, data)) # Sig, 4.909
+summary(lm(depression_score ~ Q7A, data)) # Sig, 5.257
+summary(lm(depression_score ~ Q12A, data)) # Sig, 5.968
+
+
+summary(lm(depression_score ~ Q8A + Q11A + Q36A + Q22A + Q27A, data)) # 5 biggest predictors
+# Rsq = 0.5671, adj rsq = 0.567, F(5, 39769) = 10420, p < .001
+# Everything significant, Q36A and then Q11A are the biggest predictors
+plot(lm(depression_score ~ Q8A + Q11A + Q36A + Q22A + Q27A, data))
+# Almost unusable with the residuals
+# This model explains 94% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 5 instead of 28 predictors. This is encouraging!
+```
+
+### Demographic Predictors
+
+```{r EDA Modeling Depression Dem}
+summary(lm(depression_score ~ education, data)) # Overall sig, rsq of like 0.03 tho
+summary(lm(depression_score ~ factor(orientation), data)) # Overall sig, again rsq of like 0.016
+summary(lm(depression_score ~ factor(race), data)) # Overall sig, rsq = 0.005
+summary(lm(depression_score ~ urban, data)) # Overall sig, rsq = 0.0008
+summary(lm(depression_score ~ factor(gender), data)) # Overall sig, rsq = 0.005
+summary(lm(depression_score ~ age, data)) # Overall sig, rsq = 0.003
+summary(lm(depression_score ~ factor(voted), data)) # Overall sig, rsq = 0.01
+summary(lm(depression_score ~ factor(married), data)) # Overall sig, rsq = 0.02
+summary(lm(depression_score ~ familysize, data)) # Overall sig, rsq = 0.002
+# Vaguely the same as anxiety
+
+summary(lm(depression_score ~ education + factor(orientation) + factor(race) +
+             urban + factor(gender) + age + factor(voted) + factor(married) + 
+             familysize, data)) # Overall sig, rsq = 0.05
+# Only variables sig are education, orientation, race, marriage, family size
+```
+
+### Personality
+
+```{r EDA Modeling Depression Personality}
+summary(lm(depression_score ~ extraversion, data)) # Sig, rsq = 0.09
+summary(lm(depression_score ~ agreeableness, data)) # Sig, rsq = 0.03
+summary(lm(depression_score ~ conscientiousness, data)) # Sig, rsq = 0.09
+summary(lm(depression_score ~ emotional_stability, data)) # Sig, rsq = 0.28
+summary(lm(depression_score ~ openness, data)) # Sig, rsq = 0.05
+
+summary(lm(depression_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, data)) # Sig, rsq = 0.34
+plot(lm(depression_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, data))
+# Like it's not good
+
+plot(lm(depression_score ~ emotional_stability, data))
+# lol
+```
+
+### Good Simple Model
+
+```{r EDA Modeling Depression Good Simple Model}
+summary(lm(depression_score ~ Q8A + Q11A + Q36A + Q22A + Q27A +
+             emotional_stability + extraversion, data)) # Rsq = 0.5948 = adj rsq, F(7, 38977) = 8174, p < .001
+# Substantial improvement, almost as good as 28 predictors
+
+plot(lm(depression_score ~ Q8A + Q11A + Q36A + Q22A + Q27A +
+             emotional_stability + extraversion, data))
+# Might be slightly better
+```

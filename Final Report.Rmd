@@ -1,0 +1,745 @@
+---
+title: "\"I ain't reading all that\": Exploration and evaluation of an abbreviated screening tool for depression, anxiety, and stress"
+author: "Dav King"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r Setup, echo = F}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+```{r Libraries and Data}
+library(MASS)
+library(tidyverse)
+library(tidymodels)
+library(readr)
+library(GGally)
+library(corrplot)
+library(glmnet)
+library(tree)
+library(randomForest)
+library(splines)
+library(viridis)
+library(knitr)
+library(cowplot)
+
+grid <- 10^seq(10, -2, length = 100)
+data <- read_delim("data.csv", delim = "\t", 
+                   escape_double = FALSE, trim_ws = TRUE)
+```
+
+```{r Data Transformation}
+data <- data %>% 
+  mutate(stress_score = Q1A + Q6A + Q8A + Q11A + Q12A + Q14A + Q18A + 
+           Q22A + Q27A + Q29A + Q32A + Q33A + Q35A + Q39A,
+         anxiety_score = Q2A + Q4A + Q7A + Q9A + Q15A + Q19A + Q20A +
+           Q23A + Q25A + Q28A + Q30A + Q36A + Q40A + Q41A,
+         depression_score = Q3A + Q5A + Q10A + Q13A + Q16A + Q17A + Q21A + 
+           Q24A + Q26A + Q31A + Q34A + Q37A + Q38A + Q42A) %>% 
+  mutate(stress_score_reduced = Q1A + Q6A + Q8A + Q12A + Q14A + Q18A + Q22A + 
+           Q32A + Q33A + Q35A + Q39A,
+         anxiety_score_reduced = Q2A + Q4A + Q7A + Q15A + Q19A + Q20A + Q23A +
+           Q25A + Q30A + Q36A + Q41A,
+         depression_score_reduced = Q3A + Q5A + Q16A + Q17A + Q24A + Q26A +
+           Q31A + Q34A + Q37A + Q38A + Q42A) %>% 
+  mutate(stress_score = stress_score - 14, # Original responses are based on 0-3 scale
+         anxiety_score = anxiety_score - 14, # Dataset is based on 1-4 scale
+         depression_score = depression_score - 14) %>% # 14 questions per scale
+  mutate(stress_score_reduced = stress_score_reduced - 11,
+         anxiety_score_reduced = anxiety_score_reduced - 11, # Same idea here
+         depression_score_reduced = depression_score_reduced - 11) %>% 
+  mutate(stress_cat = case_when(
+    stress_score <= 14 ~ "Normal",
+    stress_score <= 18 ~ "Mild",
+    stress_score <= 25 ~ "Moderate",
+    stress_score <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ), anxiety_cat = case_when(
+    anxiety_score <= 7 ~ "Normal",
+    anxiety_score <= 9 ~ "Mild",
+    anxiety_score <= 14 ~ "Moderate",
+    anxiety_score <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ), depression_cat = case_when(
+    depression_score <= 9 ~ "Normal",
+    depression_score <= 13 ~ "Mild",
+    depression_score <= 20 ~ "Moderate",
+    depression_score <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(stress_cat = factor(stress_cat,
+                             levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")),
+         anxiety_cat = factor(anxiety_cat,
+                              levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")),
+         depression_cat = factor(depression_cat,
+                                 levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>%
+  mutate(stress_bin = factor(if_else(stress_score > 18, "High", "Low")),
+         anxiety_bin = factor(if_else(anxiety_score > 9, "High", "Low")),
+         depression_bin = factor(if_else(depression_score > 13, "High", "Low"))) %>% 
+  mutate(TIPI4 = if_else(TIPI4 == 0, NA, TIPI4)) %>% 
+  mutate(TIPI4 = if_else(is.na(TIPI4), 4, TIPI4))
+
+data <- data %>% 
+  mutate(anxiety_trans = sqrt(anxiety_score))
+
+set.seed(322)
+split <- initial_split(data, prop = .75)
+trainData <- training(split)
+testData <- testing(split)
+
+trainSubset <- trainData %>% 
+  select(stress_score, stress_bin, anxiety_score, anxiety_trans,
+         anxiety_bin, depression_score, depression_bin,
+         stress_score_reduced, anxiety_score_reduced, depression_score_reduced,
+         Q11A, Q27A, Q29A, Q9A, Q28A, Q40A, Q10A, Q13A, Q21A, TIPI4)
+
+stress_qs <- c(1, 6, 8, 11, 12, 14, 18, 22, 27, 29, 32, 33, 35, 39)
+anxiety_qs <- c(2, 4, 7, 9, 15, 19, 20, 23, 25, 28, 30, 36, 40, 41)
+depression_qs <- c(3, 5, 10, 13, 16, 17, 21, 24, 26, 31, 34, 37, 38, 42)
+```
+
+
+
+# Introduction
+
+Mental disorders are phenomena which are far more prevalent than many realize. Discussions of mental health have long been stigmatized, leading many with mental disorders to falsely believe they are alone - while one study calculated that the proportion of adults who at some point meet the diagnostic criteria for at least one mental disorder is as high as 83% (Schaefer et al., 2017). In combination with the lack of accessible mental healthcare around the world, a far lower percentage, then, ever actually get diagnosed - preventing them from accessing the care that they need and furthering the stigma around mental illness. One useful tool that has grown in popularity in recent years is psychometric diagnostics: generally survey-like questionnaires, administered by clinicians to classify the presence and extent of symptoms. These diagnostics provide a streamlined, standardized tool that can support the case for a diagnosis while requiring few resources to administer.
+
+However, despite their advantages, there are still some shortcomings to psychometric diagnostic tools. A clear issue is the fact that many of these tools are very long, requiring extensive time and energy to fill out. This is a problem across all survey research: it has been shown that increased survey length predicts decreased response rates (Edwards et al., 2004) and may increase missing data (Rammstedt & Beierlein, 2014). This issue has been specifically addressed as a growing problem in psychometric research. Some researchers point to the fact that inter-item correlation tends to be over-emphasized as a criterion for validity in these scales, which lends itself to long, seemingly repetitive scales that may increase attrition among respondents (Stanton et al., 2002). Other researchers have suggested that shorter scales, especially in large-scale implementation settings, may reduce boredom and fatigue and alleviate the potential negative effect of lengthy questionnaires on participants' cognitive and motivational processes (Rammstedt & Beierlein, 2014). However, despite these clear drawbacks to lengthy psychometric scales and clear suggestions for ways to shorten them, psychometric surveys are only growing longer and little research that I can find has been conducted on the topic of shortening existing surveys. The purpose of this study, then, is to begin to explore the feasibility and efficacy of shortening psychometric diagnostics into abbreviated screening tools, with the eventual goal of making such diagnostics less taxing and more accessible around the world.
+
+The specific diagnostic in question for this study are the Depression Anxiety Stress Scales (DASS; Lovibond & Lovibond, 1995). Anxiety and depression are two of the most frequently occurring disorders among US adults, with some estimates placing their prevalence as high as 12.5% and 5%, respectively (National Center for Health Statistics, 2023). These scales are designed to measure three different psychological constructs (depression, anxiety, and stress), but are represented in a single set of 42 Likert-type questions. While an abridged, 21-question version of these scales has been published, I believe that an effective screening tool can be implemented with substantially fewer items. Between the wealth of data provided by these lengthy scales and their relevance as diagnostic tools for highly prevalent disorders, these scales are a phenomenal candidate for exploring the reduction of psychometric scales into short screeners.
+
+The primary goal in this project is to select a subset of variables from these scales that provide strong predictive performance over the scale to form an abbreviated screening tool, and subsequently to define a model over these variables that yields strong predictive accuracy. While any insights gleamed from the data may be useful, the primary purpose of this project is prediction, with interpretability left as an afterthought. Specifically, the goals of this project are the following:
+
+1) Explore the dataset and identify items with high cross-scale predictive power.
+
+2) Select three questions from each subscale to be used as predictors in the abbreviated screening tool, as well as any other useful demographic predictors.
+
+  - 2.1) These questions will be selected based on predictive power over their own subscale, predictive power over the other two subscales, and a general assessment of their difference from one another (with the goal of selecting questions that do not simply rephrase one another).
+  
+  - 2.2) Demographic and personality variables will also be evaluated as potential predictors.
+  
+3) Combine these questions into one short, easy-to-understand screening tool that can be completed in under two minutes and will accurately predict which participants may need further, more extensive testing.
+
+4) Develop a predictive model for each of these three constructs, selected through 10-fold cross-validation performed on a 75% training subset of the data.
+
+5) Evaluate the performance of the selected models on the remaining 25% of the data.
+
+6) Draw conclusions regarding the efficacy of each model in predicting the corresponding DASS construct, and provide recommendations for how this screening tool might and might not be used.
+
+There are a few important caveats in this study. First, as will be mentioned below, there are some concerns with the validity of these data as representative of the population as a whole. Thus, while this study can provide useful insights, it should not be used alone for the validation of an entirely new tool. Second, the computed DASS scales are simply summations of their items, and the variables we are selecting are these same items (which quite literally compose a part of their predicted response variable). While we mitigate this problem somewhat by creating a reduced version of each response that does not include the selected predictors, and showing that these do not suggest a different, better model specification, this is still a real concern with independence to take into account. Third, while the Likert-type participant responses are technically discrete, they are treated here as continuous predictors (though this approach is well-established in the literature). Fourth, no psychometric scale can be validated without empirical research data. While this diagnostic tool could be useful for its intended purpose of recommending certain users for further psychological evaluation, it is *not* intended to be a replacement for full-length diagnostic tools and evaluation by a licensed clinician. The purpose of this tool is to simply and effectively screen users to determine who may need further testing. Fifth, while I have some experience in psychology and generally understand the potential strengths and drawbacks of this approach, I am by no means a licensed, certified professional in this domain. Though I believe that an effective screening tool is developed in this study, it would not be wise to implement it in a practical setting without evaluation by psychology professionals, which goes beyond the scope of this study. However, despite these limitations, there is still much to be gained from the initial explorations of psychometric scale reductions that are evaluated in this study.
+
+# Data
+
+These data were originally sourced from a compiled dataset on Kaggle, which drew open-sourced raw data from Openpsychometrics.org (Greenwell, 2020). These data contain just shy of 40,000 responses to the DASS with zero missing data, including responses to all 42 items on the DASS, the order in which items were presented to each participant, and the time that it took for the participant to respond to each item The data also include responses to the full Ten-Item Personality Inventory (TIPI), which measures participants' Big 5 personality traits (openness, conscientiousness, extraversion, agreeableness, & neuroticism/emotional stability; Gosling et al., 2003), as well as several demographic variables. All of these variables are defined in the file `codebook.txt`; this codebook was compiled for the data on Kaggle and has not been modified.
+
+Upon initial inspection, the data provide immediate motivation for the reduction of these scales. Demonstrated in Figure 1 below, the median time for participants to respond to each item in the DASS decreases almost monotonically (and initially quite rapidly) as a function of the item's position in the survey. In other words, it took participants much longer to respond to the first couple of items in the survey, and the further they got in the survey the less time they spent on responding to each item. While there are obvious explanations for why response times may have been high for the first couple of items, this trend overall suggests that participants may have A) been able to settle on their responses quite quickly, and thus not need additional redundant questions to convey the constructs of depression, anxiety, and stress, and B) given less attention and consideration to later questions, reducing somewhat their validity. Figure B.1 in the appendix shows that this same pattern holds across all three scales.
+
+```{r Response Time by Rank Order, fig.height = 2.5}
+data %>% 
+  select(starts_with("Q") & !ends_with("A")) %>% 
+  mutate(resp = row_number()) %>%
+  pivot_longer(cols = -resp) %>% 
+  mutate(type = str_split_i(name, "", -1),
+         name = str_split(name, "[EI]", simplify = T)[,1]) %>%
+  pivot_wider(names_from = type, values_from = value) %>% 
+  mutate(name = str_remove_all(name, "[A-Z]")) %>% 
+  mutate(name = as.integer(name)) %>% 
+  group_by(I) %>% 
+  summarize(med_time = median(E)) %>% 
+  ggplot(aes(x = I, y = med_time)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Position in Survey", y = "Median Response Time (ms)",
+       title = "Response Times Decrease Later in Survey",
+       caption = "Figure 1") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Constructing the depression, anxiety, and stress scales of the DASS is quite straightforward - the relevant questions for each scale (which can be found in the manual) are simply added together. The DASS measures responses from 0-3, but these data were reported on a scale of 1-4; thus, when each 14-item scale had been created, a value of 14 was subtracted from each score to correct for this. These served as the response variables in our modeling. Box-Cox transformations were employed to see whether each variable would perform better under some transformation towards normalcy, and exploratory modeling was performed for all three variables both with and without transformation. The scales for stress and depression did not suggest any meaningful improvement from transformation, but anxiety did and thus it was replaced by its own square root. Distributions of all three (untransformed) variables can be seen in Figure 2, and the transformation of anxiety is shown in appendix Figure B.2.
+
+```{r Distributions of Variables, fig.height = 3}
+data %>% 
+  select(stress_score, anxiety_score, depression_score) %>% 
+  pivot_longer(everything(), names_to = "Scale") %>% 
+  mutate(Scale = case_when(
+    Scale == "stress_score" ~ "Stress",
+    Scale == "anxiety_score" ~ "Anxiety",
+    T ~ "Depression"
+  )) %>% 
+  ggplot(aes(x = value, fill = Scale)) +
+  geom_histogram(color = "white", bins = 43) +
+  facet_wrap(~ Scale) +
+  theme_bw() +
+  scale_fill_viridis(discrete = T, option = "D") +
+  labs(x = "Score", y = "Number of Observations", 
+       title = "Distributions of DASS Scores", caption = "Figure 2") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+```
+
+Additionally, using cutoffs that can be found in the DASS manual (and shown in Table 1 below), these variables can be cut into the categories "Normal," "Mild," "Moderate," "Severe," and "Extremely Severe." Although these categories were not used for prediction, they are useful both for data exploration and for model evaluation, and are printed here in Figure 3.
+
+```{r Distributions of Categories, fig.height = 3}
+data %>% 
+  select(stress_score, anxiety_score, depression_score) %>% 
+  mutate(Stress = case_when(
+    stress_score <= 14 ~ "Normal",
+    stress_score <= 18 ~ "Mild",
+    stress_score <= 25 ~ "Moderate",
+    stress_score <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  Anxiety = case_when(
+    anxiety_score <= 7 ~ "Normal",
+    anxiety_score <= 9 ~ "Mild",
+    anxiety_score <= 14 ~ "Moderate",
+    anxiety_score <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  Depression = case_when(
+    depression_score <= 9 ~ "Normal",
+    depression_score <= 13 ~ "Mild",
+    depression_score <= 20 ~ "Moderate",
+    depression_score <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  select(Stress, Anxiety, Depression) %>% 
+  pivot_longer(everything(), names_to = "Scale") %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>%
+  ggplot(aes(x = value, fill = Scale)) +
+  geom_bar() +
+  facet_wrap(~ Scale) +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Category", y = "Number of Observations",
+       title = "Categorizations of Anxiety, Depression, and Stress",
+       caption = "Figure 3") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+When Openpsychometrics collected these data, they asked participants if they had A) answered truthfully and B) were willing to have their data collected for research purposes, and only collected the data of participants who answered yes to both. However, Figures 2 and 3 show concerning trends that lead to suspicion over the accuracy of these data. It is worth noting that these data were collected via online convenience sample - participants had to seek out the Openpsychometrics website in order to fill out this survey, and thus there is a clear selection bias towards participants who may have higher symptoms of anxiety, depression, and stress in general. The first point of concern is in Figure 2, where all three scales have a strong uptick for the maximum possible score (i.e., participants who went through and selected "applied to me very much" for every single question). These are not necessarily valid data, and this speaks to the importance of reverse-scored items in any psychometric scale. However, these data were not removed from this dataset, as it is impossible to know how many of these responses were truly genuine. The second point of concern is in Figure 3. It is clear that very high proportions of these participants (indirectly) classified their symptoms as severe and extremely severe - far more than would be expected of the general population. However, while this may speak to the need for these models to be evaluated on a more accurate population, this is actually an asset of this dataset. By oversampling participants in categories of high severity, it is much easier to build a model that can predict for these extremes, rather than facing the usual difficulty in prediction when the population at risk is much smaller in number than the population not at risk.
+
+The scores of these scales all have high correlation with one another (Stress-Anxiety = .802, Stress-Depression = .740, Anxiety-Depression = .670; see Figure B.3). Additionally, a principal component analysis was conducted on these DASS questions, under the assumption that three subscales should yield three meaningful principal components. However (as seen in Table 2 and Figure B.4), one principal component explained about 45.2% of the variance in the DASS. Taken together, these suggest that either the DASS subscales do not accurately capture their construct and their construct alone, or (more likely) that anxiety, depression, and stress are not entirely separable from one another. However, it is still possible to differentiate them somewhat - the second principal component (explaining about 6.8% of the variance) distinguishes anxiety and stress from depression, while the third (explaining about 3.9%) teases apart anxiety and stress. No other principal component explained more than 3% of the variance.
+
+Demographic variables turned out to be very unimportant as predictors in this dataset, and so they are not discussed here beyond mentioning that i) the population generally skewed very young (i.e., people in their 20s) and ii) the majority of these data came from Malaysia. The final variable considered is the TIPI. Generally, the TIPI results of these data aligned with those from other research - roughly normally distributed, and centered around the midpoint of the scale. There were some missing data on the TIPI. Thus, on item TIPI4 (the only variable from TIPI used as a predictor), missing data were imputed as a score of 4 rather than deleted from the dataset. This was done for a few reasons: 1) these made up a very small subset of the observations, and this allows us to not delete potentially useful observations from the dataset; 2) TIPI4 was already generally the weakest of the predictors, and 3) a score of 4 corresponds to the value "neither agree nor disagree," and this seems like a reasonable value to impute for missing data (in fact, there is an argument to be made that this is an equivalent response).
+
+
+# Methodology
+
+## Variable Selection
+
+The first, and more important, aspect of this project was to select the variables for the abbreviated diagnostic tool. Variable selection was performed under several constraining criteria. First, in order to meet the goal of keeping this diagnostic tool under two minutes, I decided to pull the most predictive three items from each of the three scales. This would be paired with whichever demographic and personality variables were relevant and easy to collect. Second, since we were reducing these scales down to just three of their items, an important selection criterion was to select items that were strong predictors of the other two scales as well. Third, once a set of realistic candidate variables had been identified, care was taken to ensure that the items were substantially different, and not simply restatements of one another.
+
+In order to determine which variables were the strongest predictors, several different models were run. Each model was trained on the 75% of the data randomly selected for training, and predicted the transformed and untransformed depression, anxiety, and stress scores. The highest weight in variable selection was placed on the findings from random forest models (i.e., decision trees grown on resampled data using a random subset of the predictors) and bagging models (i.e., random forest models using all 63 predictor variables) because these ensemble learning models provide more than just one view of the data and thus give a clearer image of variable importance. These expensive models were run for each response variable, using $m$ = 8 predictors in the random forests, and their variable importance plots are shown in Figures C.1-3 below. However, these forest models were not alone. Linear regression models, shrinkage models (ridge & lasso; models designed to bias coefficients towards 0), and boosting models (trees grown sequentially on the residuals of the previous) were also calculated. In these regression models, larger coefficients (in absolute value, though almost all were positive) meant a more important variable. Different types of predictions were run for each scale: prediction from its own items, prediction from the items of other scales, prediction from the TIPI, and prediction from demographic variables.
+
+This modeling process revealed several important findings. First, there was minimal evidence that any demographic variables were meaningful predictors. This finding supports the validity of the DASS, as it suggests that the scale's predictions are not largely affected by cultural, racial, national, or physical characteristics. Second, none of the TIPI items were significant, except for the two (TIPI4 and TIPI9) making up the neuroticism/emotional stability trait. This is consistent with previous findings that neuroticism is the only Big 5 personality trait which predicts mental health (e.g., Gale et al., 2016). As this was the only variable that consistently predicted all three scales outside of the DASS questions, TIPI4 was selected as a predictor for this diagnostic tool. Whether a single item from the TIPI can meaningfully be administered alone is a valid concern, but it is beyond the scope of this study.
+
+Based on the findings from these models, items from the DASS were selected based on their predictive strength within both their own subscale and the other two subscales, as well as their ability to capture slightly different constructs (based on my own best judgement). The final variables selected were:
+
+ - Stress: `Q11A`, `Q27A`, `Q29A`
+ - Anxiety: `Q9A`, `Q28A`, `Q40A`
+ - Depression: `Q10A`, `Q13A`, `Q21A`
+ 
+These variables, along with TIPI4, comprised the ten predictors chosen for this new diagnostic tool. To see what that tool might look like, with written-out specifications of each of these items, see Appendix A. Adding up the response times for these questions (excluding outliers), we find that it in general takes participants less than 45 seconds to answer all nine questions. Even when accounting for the extra time to respond to TIPI4 and to read two sets of directions, this still seems highly likely to keep us under our goal of two minutes to complete the entire questionnaire.
+
+```{r Time to Answer all Questions, fig.height = 4}
+tot_resp_time <- trainData %>% 
+  select(Q11E, Q27E, Q29E, Q9E, Q28E, Q40E, Q10E, Q13E, Q21E) %>% 
+  mutate(tot_resp = Q11E + Q27E + Q29E + Q9E + Q28E + Q40E + Q10E +
+           Q13E + Q21E) %>% 
+  filter(tot_resp < quantile(tot_resp, .75) + 1.5 * median(tot_resp)) %>% 
+  filter(tot_resp > quantile(tot_resp, .25) - 1.5 * median(tot_resp)) %>% 
+  mutate(tot_resp = tot_resp / 1000) %>% 
+  ggplot(aes(x = tot_resp)) +
+  geom_density(fill = "gray30", alpha = 0.3) +
+  scale_x_continuous(labels = function(x) sprintf("%d:%02d", floor(x/60),
+                                                  floor(x) %% 60)) +
+  theme_bw() +
+  labs(x = "Total Response Time", y = "Density",
+       title = "Density of Total Response Times",
+       caption = "Figure 4.1") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ind_resp_time <- trainData %>% 
+  select(Q11E, Q27E, Q29E, Q9E, Q28E, Q40E, Q10E, Q13E, Q21E) %>% 
+  pivot_longer(everything()) %>% 
+  mutate(name = str_remove_all(name, "[A-Z]")) %>% 
+  mutate(name = as.integer(name)) %>% 
+  mutate(scale = case_when(
+    name %in% stress_qs ~ "Stress",
+    name %in% anxiety_qs ~ "Anxiety",
+    name %in% depression_qs ~ "Depression",
+    T ~ NA
+  )) %>% 
+  filter(value < quantile(value, .75) + 1.5 * median(value)) %>% 
+  filter(value > quantile(value, .25) - 1.5 * median(value)) %>% 
+  mutate(value = value / 1000) %>% 
+  ggplot(aes(x = value, fill = scale)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~name) +
+  theme_bw() +
+  scale_fill_viridis(discrete = T, option = "D") +
+  labs(x = "Time to Respond (s)", y = "Density", 
+       title = "Density of Question Response Time", fill = "Scale",
+       caption = "Figure 4.2") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "top")
+
+plot_grid(tot_resp_time, ind_resp_time)
+```
+
+These predictors are all relatively uncorrelated with each other (considering their intention to capture the same constructs), with correlations ranging from .698 (Q21-Q10) to .312 (TIPI4-Q10; see Figure C.4).
+
+
+## Model Selection
+
+With our variables selected, we now turn to the second part of this project: predictive modeling. The goal of this model is prediction alone; thus, interpretability is not a major concern. This allowed more complicated models, including nonlinear and interaction terms, to be considered. One of the biggest concerns with nonlinear predictors (especially polynomials) is end behavior - that is, predictions for data points that fall outside (or at the extremes) of the training data. However, in this case, our scales are restricted to integers from 0-3 for DASS questions and integers 1-7 for TIPI. No inputs can ever be given beyond these values; thus, we do not need to be too concerned about constraining the end behavior of our models, and can utilize more flexible predictors if the data support this decision.
+
+The goal of this modeling was to select three different models: one each for predicting scores for stress, anxiety, and depression. Although models for classification into categories of "high" and "low" risk based on some arbitrary cutoff point were considered, these classification models did not significantly outperform the equivalent predictions of a regression model with a designated cutoff, and they provide substantially less information than a regression model does. Thus, they were not retained for final consideration.
+
+To evaluate and compare models, I computed mean squared error through 10-fold cross-validation to estimate the testing error of each model specification. Mean squared error was used because it is a direct calculation of testing error (which we are trying to minimize), and because it can be calculated without any respect to the parameters of the model, making it a more flexible and adaptable measure. This 10-fold cross-validation was conducted across the 75% training subset, so that the selected models could then be evaluated on the remaining, unseen test set.
+
+For each scale, several different types of models were considered. These specifications included (with various interactions and nonlinear predictors): linear regression models, shrinkage (ridge & lasso) models, generalized additive models focused on polynomial terms, bagging & random forest models, and non-parametric $k$-nearest neighbors regression models. Because of computational complexity issues, the bagging & random forest models did not undergo 10-fold CV; instead, their out-of-bag error estimates were computed, and they were compared to the best-performing models from the CV approach on their test set predictive performance. In all cases, these forest models performed substantially worse than other regression models; thus, this use of reserved data was not an issue.
+
+For each scale, models were also considered on the "reduced" version of the scales, that is, the sum of all items in each DASS scale excluding the three used as predictors in this abbreviated tool. This was done to ensure that the problem of dependent variables predicting a response variable that they partially compose did not impair model selection. However, the correlations between the full and reduced versions of all three scales were higher than .98, and in no cases did the MSE calculated on the reduced scale favor a different model than the MSE calculated on the full scale. Thus, these models will not be discussed further.
+
+For all three scales, some form of generalized additive model was selected, with polynomial expressions of some DASS items and either polynomial or cubic spline expressions of TIPI4 used in the model specification. In R, the `poly()` function generates orthogonal polynomials from the dataset to use in prediction. While this is useful for a number of reasons, it does mean that these models cannot be meaningfully expressed in a written equation. Additionally, these are very lengthy models, and would be tedious to write here. Thus, for each of the following selected models, we list the specification here but will leave the details, with full coefficients, error, and probabilities, as well as a written out "equation," listed in Appendix D. Similarly, while model diagnostics are addressed here, the plots are left for the appendix. For future use, the models for stress, anxiety, and depression are stored here, for convenience, in `Stress Regression Model.RData`, `Anxiety Regression Model.RData`, and `Depression Regression Model.RData`, respectively.
+
+### Stress
+
+$$ \text{stress score} \sim \text{Q11A} + \text{Q27A} + \text{poly(Q29A, 2)} + \text{poly(Q9A, 3)} + \text{poly(Q28A, 3)} + \text{poly(Q40A, 2)} $$
+$$ + \text{Q10A} + \text{Q13A} + \text{poly(Q21A, 2)} + \text{poly(TIPI4, 3)} $$
+
+This model includes specifications of several predictors in terms of polynomials, and predicts TIPI4 with a degree-3 polynomial as well. In this model, the only non-significant variables are the second-order effects of Q9A and Q28A, both of which have significant third-order effects. This model is overall significant, F(19, 29811) = 10680, $p$ < .001. It has an $R^2$ value of 0.8719, meaning that this model can explain about 87.19% of the variance in the training `stress_score`, and its adjusted $R^2$ value is the same, which suggests that none of these variables are particularly redundant or meaningless because they all provide some additional information to the prediction. This same specification (with different coefficients) also explains about 78.84% of the variance in the reduced scale, which is still very high predictive power.
+
+This model generally meets the required assumptions for regression. There are slight differences in the residuals based on fitted values, but these differences are very slim. The Q-Q plot looks very good, helping us meet the normalcy assumption of regression. While the semi-discrete, Likert-type predictors create some weird patterns in the scale-location plot, it is generally not concerning; further, there are no data points with outsized leverage skewing this model. Thus, the model overall seems largely sound.
+
+### Anxiety
+
+$$ \text{anxiety trans} \sim \text{poly(Q11A, 2)} + \text{poly(Q27A, 2)} + \text{poly(Q29A, 2)} + \text{poly(Q9A, 3)} + \text{poly(Q28A, 3)} $$
+$$ + \text{poly(Q40A, 2)} + \text{poly(Q10A, 3)} + \text{poly(Q13A, 3)} + \text{poly(Q21A, 3)} + \text{bs(TIPI4, df = 5)} $$
+
+This model includes a polynomial specification over every single DASS item, as well as a cubic spline with five degrees of freedom for TIPI4. This model is somewhat more sparse in terms of significant variables, but it is still overall significant, F(28, 29802) = 4356, $p$ < .001. It has an $R^2$ of 0.8037, meaning that this model can explain 80.37% of the variance in `anxiety_trans`, and its adjusted $R^2$ of 0.8035 suggests that, despite some lack of significance, each predictor generally provides some additional information. As a reminder, this model is specified for `anxiety_trans`, or the square root of `anxiety_score`. This specification also explains about 66.54% of the variance in the reduced scale - not as strong of a performance, but still a lot of explanation nonetheless.
+
+The assumptions of this model largely mirror those of the stress model. While the square-root transformation causes slightly more messiness in the residuals and the scale=location of this plot, these differences are generally not that large, and this model, too, seems to be generally sound.
+
+
+### Depression
+
+$$ \text{depression score} \sim \text{Q11A} + \text{Q27A} + \text{Q29A} + \text{poly(Q9A, 3)} + \text{Q28A} + \text{poly(Q40A, 3)} + \text{Q10A} $$
+$$ + \text{Q13A} + \text{poly(Q21A, 3)} + \text{bs(TIPI4, df = 5)} $$
+
+This model is, once again, defined with polynomials over around half of the DASS items, and a cubic spline for TIPI4. Almost all variables are significant; however, TIPI4 is mostly not - across all models tested, TIPI4 seems to be much less predictive of depression than it is of anxiety and stress. This model is actually more well-defined than either that of stress or anxiety. It is overall significant, F(20, 29810) = 14150, $p$ < .001, and its $R^2$ (with identical adjusted $R^2$) of 0.9047 suggests that over nine-tenths of the variance in `depression_score` can be explained by this model from just 10 predictors. This model also explains about 84.17% of the variance in the reduced scale - a very high amount, and a finding that means this model is better at predicting a scale it does not make up than the model for anxiety is at predicting a scale from *some of the variables that make it up*. While I was not expecting depression to be the easiest to model given that anxiety and stress seem more directly related, this is a good finding to have, and likely speaks to the accuracy of the DASS in capturing depression.
+
+This model, once again, has similar diagnostics to the other two. There is a little bit of trend in the residuals at different fitted values, but not enough to truly violate the assumption of constant variance; the Q-Q plot is also a little messier, but not so much as to violate the assumption of normalcy. This model appears to be, once again, quite sound overall.
+
+# Results
+
+```{r Density Plot, fig.height = 3}
+load("Stress Regression Model.RData")
+load("Anxiety Regression Model.RData")
+load("Depression Regression Model.RData")
+stress_preds <- predict(stress_final_reg, testData)
+anx_preds <- predict(anx_final_reg, testData)
+dep_preds <- predict(dep_final_reg, testData)
+truth_pred <- data.frame(stress_preds, testData$stress_score,
+                         anx_preds, testData$anxiety_score,
+                         dep_preds, testData$depression_score)
+
+truth_pred %>% 
+  mutate(anx_preds = anx_preds^2) %>% 
+  rename("Stress Empirical" = testData.stress_score,
+         "Stress Predicted" = stress_preds,
+         "Anxiety Empirical" = testData.anxiety_score,
+         "Anxiety Predicted" = anx_preds,
+         "Depression Empirical" = testData.depression_score,
+         "Depression Predicted" = dep_preds) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  separate(Distribution, into = c("Scale", "Distribution"), sep = " ") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ Scale) +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Predicted Value", y = "Density",
+       title = "How Well Did We Predict Depression, Anxiety, and Stress?",
+       caption = "Figure 5") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+```
+
+Overall, each model performed quite well over the testing data. The models for stress, anxiety, and depression had test MSE values of 14.339, 21.634 (0.389 non-adjusted), and 14.310, respectively, with comparable test MSE over the reduced scales. What this means, if we take square roots, is that on average this model mispredicts stress, anxiety, and depression by 3.787, 4.651, and 3.723, respectively. While these may seem like large values, in the grand scheme of things they are not. We knew going into this process that this tool would not be able to exactly emulate the true outcome variables, nor was the goal to do so. Instead, our goal is to generally approximate and screen users for risk of depression, anxiety, and stress, and make recommendations for further testing. In this instance, these error rates are generally small, and we can take them into account when assessing our prediction for a given user and any thresholds we may later define.
+
+Looking at the densities of each scale's predicted values over the test data versus the empirical, true distribution in Figure 5, we see that we have very closely approximated the true distributions. Across all three variables, the biggest issue is underpredicting very high values - remember from our exploratory data analysis that this survey appears to have an overrepresentation of these values to begin with. It looks as though our predictions are slightly more "centered" than are the empirical distributions, but only by a miniscule amount. The only major issue is underpredicting especially high and low response values; otherwise, these approximations seem quite true to the empirical distributions.
+
+Looking at Figure 6 below, we can see that we also categorized these variables with very high accuracy compared to the empirical distribution. In fact, across all three scales we generally under-predicted "Normal" and "Mild" while over-predicting the more severe categories - and this is generally something that we would like to do with such a model. In the development of a screening tool for mental disorders, it is far more costly to falsely label someone as "low risk" when they indeed need further testing than it is to falsely label someone as "high risk" when they do not need to be labeled as such. Overall, then, it appears that these models are serving quite well at our purpose of screening patients for the possibility of depression, anxiety, and stress, and sending those at high risk to undertake further, more extensive testing.
+
+```{r Category Plot, fig.height = 4}
+truth_pred %>% 
+  mutate(anx_preds = anx_preds^2) %>% 
+  mutate("Stress Empirical" = case_when(
+    testData.stress_score <= 14 ~ "Normal",
+    testData.stress_score <= 18 ~ "Mild",
+    testData.stress_score <= 25 ~ "Moderate",
+    testData.stress_score <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Stress Predicted" = case_when(
+    stress_preds <= 14 ~ "Normal",
+    stress_preds <= 18 ~ "Mild",
+    stress_preds <= 25 ~ "Moderate",
+    stress_preds <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Anxiety Empirical" = case_when(
+    testData.anxiety_score <= 7 ~ "Normal",
+    testData.anxiety_score <= 9 ~ "Mild",
+    testData.anxiety_score <= 14 ~ "Moderate",
+    testData.anxiety_score <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Anxiety Predicted" = case_when(
+    anx_preds <= 7 ~ "Normal",
+    anx_preds <= 9 ~ "Mild",
+    anx_preds <= 14 ~ "Moderate",
+    anx_preds <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Depression Empirical" = case_when(
+    testData.depression_score <= 9 ~ "Normal",
+    testData.depression_score <= 13 ~ "Mild",
+    testData.depression_score <= 20 ~ "Moderate",
+    testData.depression_score <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Depression Predicted" = case_when(
+    dep_preds <= 9 ~ "Normal",
+    dep_preds <= 13 ~ "Mild",
+    dep_preds <= 20 ~ "Moderate",
+    dep_preds <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  select("Stress Empirical", "Stress Predicted", "Anxiety Empirical",
+         "Anxiety Predicted", "Depression Empirical", "Depression Predicted") %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>%
+  separate(Distribution, into = c("Scale", "Distribution"), sep = " ") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ Scale) +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Category", y = "Number of Observations",
+       title = "How Well Did We Classify Depression, Anxiety, and Stress?",
+       caption = "Figure 6") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+Some checks for robustness were also performed, though they are not listed here. In general, across all three scales, residuals did not differ much by country, age, race, gender, or education levels. This suggests a high level of cross-cultural validity among these models - generally speaking, the decisions to leave out demographic variables seem justified, and these models seem robust against these characteristic interpersonal differences.
+
+# Conclusion
+
+In this brief study, we have taken nine variables from the DASS and one from the TIPI, and combined them to develop a potential screening tool for depression, anxiety, and stress with a reasonable level of accuracy. Depression, anxiety, and stress all seem highly related to one another, and the DASS can predominately be explained in terms of a single principal component. However, these scales are different enough from one another that three different model specifications are defined, and our ability to predict depression is much higher than our ability to predict anxiety and somewhat higher than our ability to predict stress. Consistent with prior findings in the literature, neuroticism is predictive of mental disorders while the other four Big 5 personality traits are not. Participants put a lot less time (and presumably thought) into questions later in the DASS, but this tool, which should be able to be filled out in under two minutes (with true estimates of the time to complete the DASS portion as low as 45 seconds), will hopefully alleviate that problem. Overall, this tool is able to very closely approximate the true scales of the DASS, explaining most of their variance without mispredicting responses by too wide of a margin. One important takeaway is this: if we are able to predict a 14-question scale from only 3 of its questions and seven other (theoretically unrelated) items to a high degree of accuracy, the potential for models that dramatically shorten existing psychometric tools is extremely salient.
+
+There are some things that this tool cannot do. For one, it can do nothing at all as of now: a tool like this should never be implemented without first validation in a controlled setting. There are some reasons to doubt in the validity of these data; thus, these findings should be taken with a grain of salt. For another, I am a statistician with a penchant for psychology but not a psychometrician; my own (statistically-aided) judgement on which variables to include in this tool is not necessarily the best opinion that an expert can give. Third, and perhaps most importantly, though I describe this tool at times as a "diagnostic" it indeed cannot diagnose. Diagnoses are not to be made by any psychometric scale without the aid of a licensed clinician, and this test is not designed to diagnose at all - merely to recommend some users for further testing.
+
+However, there are some things that (if confirmed as valid) it would be able to do quite well. This tool provides a very short, low-effort, accessible screening tool that could be implemented in disadvantaged communities all around the world. With help from a psychometrician, a theoretical cutoff value could be set, above which users should be recommended for further testing, and this would dramatically increase the number of people getting the diagnoses that they need. 
+
+This tool also paves the way for similar research to follow. In this study, we have only scratched the surface of the potential for future research in this field. Even with this set of DASS responses, more could be explored. While response times for each question were not considered as a predictor, it is entirely possible that spending more time contemplating a question may be just as important of a predictor as the actual response to that question, especially if participants are unwilling to be truthful. Additionally, while the models seemed not to differ much by demographics, early results highlighted a few such domains to explore - gender for stress, race for anxiety, education for depression. DASS modeling would also benefit from being run on other, perhaps more valid data, and this tool might be validated with empirical testing on a controlled population. But we are far from limited to just the DASS. Any number of other diagnoses, including learning disabilities, could benefit heavily from the exact type of short screening tools that this approach may be able to develop. This tool, and others like it to follow, could revolutionize psychology by making psychometric testing and psychological diagnosis more accessible than ever before. This study is just the start - but if these findings are any indication at all, there is almost unfathomable untapped potential to explore in the domain of psychological statistics.
+
+
+\newpage
+
+# References
+
+Edwards, P., Roberts, I., Sandercock, P., & Frost, C. (2004). Follow-up by mail in clinical trials: Does questionnaire length matter? *Controlled Clinical Trials, 25*, 31-52. 10.1016/j.cct.2003.08.013
+
+Gale, C.R., Hagenaars, S.P., Davies, G., Hill, W.D., Liewald, D.C.M., Cullen, B., Penninx, B.W., International Consortium for Blood Pressure GWAS, CHARGE Consortium Aging and Longevity Group, Boomsma, D.I., Pell, J., McIntosh, A.M., Smith, D.J., Dreary, I.J., & Harris, S.E. (2016). Pleiotropy between neuroticism and physical and mental health: Findings from 108,038 men and women in UK Biobank. *Translational Psychiatry, 6*(e791). 10.1038/tp.2016.56
+
+Gosling, S.D., Rentfrow, P.J., & Swann, W.B., Jr. (2003). A very brief measure of the Big Five personality domains. *Journal of Research in Personality, 37*, 504-528.10.1016/S0092-6566(03)00046-1
+
+
+Greenwell, L. (2020, June 3). *Depression Anxiety Stress Scale responses*. Kaggle. https://www.kaggle.com/datasets/lucasgreenwell/depression-anxiety-stress-scales-responses/data
+
+Lovibond, S.H., & Lovibond, P.F. (1995). *Manual for the Depression Anxiety Stress Scales.* (2nd. Ed.) Psychology Foundation. www.psy.unsw.edu.au/dass/
+
+National Center for Health Statistics. (2023, September 19). *Mental health*. Centers for Disease Control and Prevention. https://www.cdc.gov/nchs/fastats/mental-health.htm
+
+Rammstedt, B., & Beierlein, C. (2014). Can't we make it any shorter? The limits of personality assessment and ways to overcome them. *Journal of Individual Differences, 35*(4), 212-220. 10.1027/1614-0001/a000141
+
+Schaefer, J.D., Caspi, A., Belsky, D.W., Harrington, H., Houts, R., Horwood, L.J., Hussong, A., Ramrakha, S., Poulton, R., & Moffitt, T.E. (2017). Enduring mental health: Prevalence and prediction. *Journal of Abnormal Psychology, 126*(2), 212-224. 10.1037/abn0000232
+
+Stanton, J.M., Sinar, E.F., Balzer, W.K., & Smith, P.C. (2002). Issues and strategies for reducing the length of self-report scales. *Personnel Psychology, 55*(1), 167-194. 10.1111/j.1744-6570.2002.tb00108.x
+
+\newpage
+
+# Appendix A: View of Diagnostic Questionnaire
+
+Please read each statement and circle (select) a number 0, 1, 2, or 3 which indicates how much the statement applied to you *over the past week*. There are no right or wrong answers. Do not spend too much time on any statement.
+
+*The rating scale is as follows:*
+
+0 Did not apply to me at all
+
+1 Applied to me to some degree, or some of the time
+
+2 Applied to me to a considerable degree, or a good part of the time
+
+3 Applied to me very much, or most of the time
+
+---
+
+1) I found myself getting upset rather easily.
+2) I found that I was very irritable.
+3) I found it hard to calm down after something upset me.
+4) I found myself in situations that made me so anxious I was most relieved when they ended.
+5) I felt I was close to panic.
+6) I was worried about situations in which I might panic and make a fool of myself.
+7) I felt that I had nothing to look forward to.
+8) I felt sad and depressed.
+9) I felt that life wasn't worthwhile.
+
+---
+
+The following personality traits may or may not apply to you. Please write a number next to the statement to indicate the extent to which you agree or disagree with that statement. You should rate the extent to which the pair of traits applies to you, even if one characteristic applies more strongly than the other.
+
+1 = Disagree strongly
+
+2 = Disagree moderately
+
+3 = Disagree a little
+
+4 = Neither agree nor disagree
+
+5 = Agree a little
+
+6 = Agree moderately
+
+7 = Agree strongly
+
+---
+
+I see myself as:
+
+__ Anxious, easily upset.
+
+
+\newpage
+
+# Appendix B: Data Visualizations
+
+```{r Response Time by Rank Order and Scale}
+data %>% 
+  select(starts_with("Q") & !ends_with("A")) %>% 
+  mutate(resp = row_number()) %>%
+  pivot_longer(cols = -resp) %>% 
+  mutate(type = str_split_i(name, "", -1),
+         name = str_split(name, "[EI]", simplify = T)[,1]) %>%
+  pivot_wider(names_from = type, values_from = value) %>% 
+  mutate(name = str_remove_all(name, "[A-Z]")) %>% 
+  mutate(name = as.integer(name)) %>% 
+  mutate(scale = case_when(
+    name %in% stress_qs ~ "Stress",
+    name %in% anxiety_qs ~ "Anxiety",
+    name %in% depression_qs ~ "Depression",
+    T ~ NA
+  )) %>% 
+  group_by(I, scale) %>% 
+  summarize(med_time = median(E)) %>% 
+  ggplot(aes(x = I, y = med_time, color = scale)) +
+  geom_point() +
+  facet_wrap(~scale, ncol = 1) +
+  theme_bw() +
+  labs(x = "Position in Survey", y = "Median Response Time (ms)",
+       title = "Response Times Decrease Later in Survey",
+       caption = "Figure B.1") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none") +
+  scale_color_viridis(discrete = T, option = "D")
+```
+
+```{r Anxiety vs Anxiety Transformed, fig.height = 3.5}
+data %>% 
+  select(anxiety_score, anxiety_trans) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(Distribution = case_when(
+    Distribution == "anxiety_score" ~ "Original",
+    T ~ "Transformed"
+  )) %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ Distribution, scales = "free") +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Score", y = "Density of Observations",
+       title = "Transformation of Anxiety Score", caption = "Figure B.2") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+```
+
+```{r Cutoff Values Table}
+cutoff_vals <- data.frame(Category = "Normal", Stress = "0-14",
+                          Anxiety = "0-7", Depression = "0-9")
+cutoff_vals <- rbind(cutoff_vals,
+      c("Mild", "15-18", "8-9", "10-13"),
+      c("Moderate", "19-25", "10-14", "14-20"),
+      c("Severe", "26-33", "15-19", "21-27"),
+      c("Extremely Severe", "34+", "20+", "28+"))
+
+kable(cutoff_vals, caption = "Cutoff Values")
+```
+
+```{r GGPairs Plot}
+data %>% 
+  select(stress_score, anxiety_score, depression_score) %>% 
+  rename(Stress = stress_score, Anxiety = anxiety_score,
+         Depression = depression_score) %>% 
+  ggpairs() +
+  theme_bw() +
+  labs(title = "Pairwise Correlations Between Response Variables",
+       caption = "Figure B.3") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r PCA Plot, fig.height = 4}
+DASS_subset <- data %>% 
+  select(starts_with("Q") & ends_with("A"))
+
+pca.2 <- prcomp(DASS_subset, scale = T, rank. = 3)
+pca_var_2 <- pca.2$sdev^2
+pca_var_pct_2 <- pca_var_2 / sum(pca_var_2)
+pca_vars <- data.frame(Component = seq(1:length(pca_var_pct_2)),
+                       Variance = pca_var_pct_2)
+pca_vars %>% 
+  slice(1:3) %>% 
+  kable(digits = 4, caption = "Principal Component Variance")
+
+pca_loadings <- pca.2$rotation
+
+stress_loadings <- pca_loadings[stress_qs,]
+anx_loadings <- pca_loadings[anxiety_qs,]
+dep_loadings <- pca_loadings[depression_qs,]
+
+pca_df <- data.frame(stress_loadings, Scale = "Stress")
+pca_df <- rbind(pca_df,
+      data.frame(anx_loadings, Scale = "Anxiety"),
+      data.frame(dep_loadings, Scale = "Depression"))
+pca_df %>% 
+  pivot_longer(starts_with("PC")) %>% 
+  mutate(name = case_when(
+    name == "PC1" ~ "PC1 (45.2%)",
+    name == "PC2" ~ "PC2 (6.8%)",
+    T ~ "PC3 (3.9%)"
+  )) %>% 
+  ggplot(aes(x = Scale, y = value, fill = Scale)) +
+  geom_col() +
+  facet_wrap(~ name) +
+  theme_bw() +
+  labs(y = "Loadings", title = "Scale Loadings Onto Principal Components",
+       caption = "Figure B.4") +
+  scale_fill_viridis(discrete = T, option = "D") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+```
+
+# Appendix C: Variable Selection
+
+```{r Stress Var Importance, fig.height = 10}
+load("Stress RF.RData")
+varImpPlot(stress_rf, main = "Figure C.1: Stress Random Forest Variable Importance")
+```
+
+```{r Anx Var Importance, fig.height = 10}
+load("Anxiety RF.RData")
+varImpPlot(anx_rf, main = "Figure C.2: Anxiety Random Forest Variable Importance")
+```
+
+```{r Dep Var Importance, fig.height = 10}
+load("Depression RF.RData")
+varImpPlot(dep_rf, main = "Figure C.3: Depression Random Forest Variable Importance")
+```
+
+## Figure C.4: Correlations Between Predictors
+
+```{r Correlation of Selected Predictors, fig.height = 4}
+trainSubset %>% 
+  select(starts_with("Q"), TIPI4) %>% 
+  cor() %>% 
+  corrplot.mixed(., lower = "circle", upper = "number",
+                 lower.col = viridis(200, option = "D", direction = -1),
+                 upper.col = viridis(200, option = "D", direction = -1),
+                 tl.col = "black")
+```
+
+\newpage
+
+# Appendix D: Model Specification & Diagnostics
+
+## Stress
+
+```{r Stress Model Specification}
+summary(stress_final_reg)
+```
+
+$$ \text{stress} \hat{\_} \text{score} = 5 + 2.228 \times \text{Q11A} + 2.81 \times \text{Q27A} + 33.385 \times \text{poly(Q29A, 2)1} + 13.527 \times \text{poly(A29A, 2)2} $$
+$$ + 168.993 \times \text{poly(Q9A, 3)1} + 3.471 \times \text{poly(Q9A, 3)2} - 9.186 \times \text{poly(Q9A, 3)3} + 256.914 \times \text{poly(Q28A, 3)1} $$
+$$ + 5.191 \times \text{poly(Q28A, 3)2} + 12.174 \times \text{poly(Q28A, 3)3} + 104.468 \times \text{poly(Q40A, 2)1} + 20.599 \times \text{poly(Q40A, 2)2} $$
+$$ + 0.384 \times \text{Q10A} + 0.581 \times \text{Q13A} + 58.361 \times \text{poly(Q21A, 2)1} + 12.127 \times \text{poly(Q21A, 2)2} $$
+$$ + 94.913 \times \text{poly(TIPI4, 3)1} + 34.533 \times \text{poly(TIPI4, 3)2} + 17.898 \times \text{poly(TIPI4, 3)3} $$
+
+```{r Stress Model Diagnostics}
+par(mfrow = c(2, 2))
+plot(stress_final_reg)
+```
+
+\newpage
+
+## Anxiety
+
+```{r Anxiety Model Specification}
+summary(anx_final_reg)
+```
+
+$$ \text{anxiety} \hat{\_} \text{trans} = 3.604 + 8.782 \times \text{poly(Q11A, 2)1} - 1.292 \times \text{poly(Q11A, 2)2} + 11.849 \times \text{poly(Q27A, 2)1}  $$
+$$ -2.002 \times \text{poly(Q27A, 2)2} + 21.217 \times \text{poly(Q29A, 2)1} - 1.583 \times \text{poly(Q29A, 2)2} + 62.129 \times \text{poly(Q9A, 3)1} $$
+$$ -12.477 \times \text{poly(Q9A, 3)2} + 3.996 \times \text{poly(Q9A, 3)3} + 76.436 \times \text{poly(Q28A, 3)1} - 8.47 \times \text{poly(Q28A, 3)2} $$
+$$ + 3.086 \times \text{poly(Q28A, 3)3} + 60.127 \times \text{poly(Q40A, 2)1} - 12.007 \times \text{poly(Q40A, 2)2} + 9.751 \times \text{poly(Q10A, 3)1} $$
+$$ - 0.351 \times \text{poly(Q10A, 3)2} + 1.237 \times \text{poly(Q10A, 3)3} + 14.381 \times \text{poly(Q13A, 3)1} - 1.368 \times \text{poly(Q13A, 3)2} $$
+$$ + 1.008 \times \text{poly(Q13A, 3)3} + 15.821 \times \text{poly(Q21A, 3)1} - 0.613 \times \text{poly(Q21A, 3)2} + 1.125 \times \text{poly(Q21A, 3)3} $$
+$$ + 0.066 \times \text{bs(TIPI4, df = 5)1} + 0.289 \times \text{bs(TIPI4, df = 5)2} - 0.016 \times \text{bs(TIPI4, df = 5)3} $$
+$$ + 0.528 \times \text{bs(TIPI4, df = 5)4} + 0.175 \times \text{bs(TIPI4, df = 5)5} $$
+
+```{r Anxiety Model Diagnostics}
+par(mfrow = c(2, 2))
+plot(anx_final_reg)
+```
+
+\newpage
+
+## Depression
+
+```{r Depression Model Specification}
+summary(dep_final_reg)
+```
+
+$$ \text{depression} \hat{\_} \text{score} = - 1.049 + 0.288 \times \text{Q11A} + 0.664 \times \text{Q27A} + 0.423 \times \text{Q29A} + 66.114 \times \text{poly(Q9A, 3)1} $$
+$$ + 9.57 \times \text{poly(Q9A, 3)2} - 9.778 \times \text{poly(Q9A, 3)3} + 0.246 \times \text{Q28A} + 57.591 \times \text{poly(Q40A, 3)1} $$
+$$ + 13.213 \times \text{poly(Q40A, 3)2} - 9.747 \times \text{poly(Q40A, 3)3} + 3.614 \times \text{Q10A} + 3.302 \times \text{Q13A} $$
+$$ + 720.278 \times \text{poly(Q21A, 3)1} - 1.714 \times \text{poly(Q21A, 3)2} + 10.927 \times \text{poly(Q21A, 3)3} $$
+$$ + 0.532 \times \text{bs(TIPI4, df = 5)1} - 0.699 \times \text{bs(TIPI4, df = 5)2} + 0.262 \times \text{bs(TIPI4, df = 5)3} $$
+$$ - 1.1 \times \text{bs(TIPI4, df = 5)4} - 0.275 \times \text{bs(TIPI4, df = 5)5} $$
+
+```{r Depression Model Diagnostics}
+par(mfrow = c(2, 2))
+plot(dep_final_reg)
+```
+
+
+
+

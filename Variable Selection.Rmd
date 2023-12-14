@@ -1,0 +1,2649 @@
+---
+title: "Variable Selection"
+author: "Dav King"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r Libraries and Data}
+library(MASS)
+library(tidyverse)
+library(tidymodels)
+library(readr)
+library(GGally)
+library(corrplot)
+library(glmnet)
+library(tree)
+library(randomForest)
+library(gbm)
+
+grid <- 10^seq(10, -2, length = 100)
+data <- read_delim("data.csv", delim = "\t", 
+                   escape_double = FALSE, trim_ws = TRUE)
+```
+
+# Data Transformations
+
+## Creating Scales
+
+```{r DT Creating Scales}
+data <- data %>% 
+  mutate(stress_score = Q1A + Q6A + Q8A + Q11A + Q12A + Q14A + Q18A + 
+           Q22A + Q27A + Q29A + Q32A + Q33A + Q35A + Q39A,
+         anxiety_score = Q2A + Q4A + Q7A + Q9A + Q15A + Q19A + Q20A +
+           Q23A + Q25A + Q28A + Q30A + Q36A + Q40A + Q41A,
+         depression_score = Q3A + Q5A + Q10A + Q13A + Q16A + Q17A + Q21A + 
+           Q24A + Q26A + Q31A + Q34A + Q37A + Q38A + Q42A) %>% 
+  mutate(stress_score = stress_score - 14, # Original responses are based on 0-3 scale
+         anxiety_score = anxiety_score - 14, # Dataset is based on 1-4 scale
+         depression_score = depression_score - 14) %>% # 14 questions per scale
+  mutate(stress_cat = case_when(
+    stress_score <= 14 ~ "Normal",
+    stress_score <= 18 ~ "Mild",
+    stress_score <= 25 ~ "Moderate",
+    stress_score <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ), anxiety_cat = case_when(
+    anxiety_score <= 7 ~ "Normal",
+    anxiety_score <= 9 ~ "Mild",
+    anxiety_score <= 14 ~ "Moderate",
+    anxiety_score <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ), depression_cat = case_when(
+    depression_score <= 9 ~ "Normal",
+    depression_score <= 13 ~ "Mild",
+    depression_score <= 20 ~ "Moderate",
+    depression_score <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(stress_cat = factor(stress_cat,
+                             levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")),
+         anxiety_cat = factor(anxiety_cat,
+                              levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")),
+         depression_cat = factor(depression_cat,
+                                 levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")))
+```
+
+## BoxCox Transformations
+
+```{r DT BoxCox}
+stress_boxcox <- boxcox(lm(data$stress_score[data$stress_score > 0] ~ 1))
+best_stress <- stress_boxcox$x[which.max(stress_boxcox$y)]
+data <- data %>% 
+  mutate(stress_trans = (stress_score^best_stress - 1) / best_stress)
+
+data <- data %>% 
+  mutate(anxiety_trans = sqrt(anxiety_score))
+
+depression_boxcox <- boxcox(lm(data$depression_score[data$depression_score > 0] ~ 1))
+best_depression <- depression_boxcox$x[which.max(depression_boxcox$y)]
+data <- data %>% 
+  mutate(depression_trans = (depression_score^best_depression - 1) / best_depression) %>% 
+  mutate(depression_trans_2 = sqrt(depression_score))
+```
+
+## Personality Scales
+
+```{r DT Personality}
+data <- data %>% 
+  mutate(extraversion = if_else(TIPI1 == 0, NA, TIPI1) +
+           (8 - if_else(TIPI6 == 0, NA, TIPI6)),
+         agreeableness = (8 - if_else(TIPI2 == 0, NA, TIPI2)) + 
+           if_else(TIPI7 == 0, NA, TIPI7),
+         conscientiousness = if_else(TIPI3 == 0, NA, TIPI3) +
+           (8 - if_else(TIPI8 == 0, NA, TIPI8)),
+         emotional_stability = (8 - if_else(TIPI4 == 0, NA, TIPI4)) +
+           if_else(TIPI9 == 0, NA, TIPI9),
+         openness = if_else(TIPI5 == 0, NA, TIPI5) +
+           (8 - if_else(TIPI10 == 0, NA, TIPI10)))
+```
+
+## Demographic Scales
+
+### Country
+
+```{r DT Country}
+big_countries <- c("MY", "US", "GB", "CA", "ID", "PH", "AU", "NONE")
+
+data <- data %>% 
+  mutate(country_simp = if_else(country %in% big_countries, country, "Other"))
+```
+
+
+### Education
+
+```{r DT Education}
+data <- data %>% 
+  mutate(education = case_when(
+    education == 1 ~ "Less than high school",
+    education == 2 ~ "High school",
+    education == 3 ~ "University degree",
+    education == 4 ~ "Graduate degree",
+    T ~ "Unknown"
+  )) %>% 
+  mutate(education = factor(education,
+                            levels = c("Unknown", "Less than high school",
+                                       "High school", "University degree",
+                                       "Graduate degree")))
+```
+
+### Urban/Rural
+
+```{r DT Urban}
+data <- data %>% 
+  mutate(urban = case_when(
+    urban == 1 ~ "Rural",
+    urban == 2 ~ "Suburban",
+    urban == 3 ~ "Urban",
+    T ~ "Unknown"
+  )) %>% 
+  mutate(urban = factor(urban, levels = c("Unknown", "Rural",
+                                          "Suburban", "Urban")))
+```
+
+### Religion
+
+```{r DT Religion}
+data <- data %>% 
+  mutate(religion = case_when(
+    religion == 1 ~ "Agnostic",
+    religion == 2 ~ "Atheist",
+    religion == 3 ~ "Buddhist",
+    religion == 4 ~ "Christian (Catholic)",
+    religion == 5 ~ "Christian (Mormon)",
+    religion == 6 ~ "Christian (Protestant)",
+    religion == 7 ~ "Christian (Other)",
+    religion == 8 ~ "Hindu",
+    religion == 9 ~ "Jewish",
+    religion == 10 ~ "Muslim",
+    religion == 11 ~ "Sikh",
+    religion == 12 ~ "Other",
+    T ~ "Unknown"))
+```
+
+### Orientation
+
+```{r DT Orientation}
+data <- data %>% 
+  mutate(orientation = case_when(
+    orientation == 1 ~ "Heterosexual",
+    orientation == 2 ~ "Bisexual",
+    orientation == 3 ~ "Homosexual",
+    orientation == 4 ~ "Asexual",
+    orientation == 5 ~ "Other",
+    T ~ "Unknown"
+  ))
+```
+
+### Race
+
+```{r DT Race}
+data <- data %>% 
+  mutate(race = case_when(
+    race == 10 ~ "Asian",
+    race == 20 ~ "Arab",
+    race == 30 ~ "Black", 
+    race == 40 ~ "Indigenous Australian",
+    race == 50 ~ "Native American",
+    race == 60 ~ "White",
+    race == 70 ~ "Other",
+    T ~ "Unknown"
+  ))
+```
+
+### Gender
+
+```{r DT Gender}
+data <- data %>% 
+  mutate(gender = case_when(
+    gender == 1 ~ "Male",
+    gender == 2 ~ "Female",
+    gender == 3 ~ "Other",
+    T ~ "Unknown"
+  ))
+```
+
+### Voting
+
+```{r DT Voting}
+data <- data %>% 
+  mutate(voted = case_when(
+    voted == 1 ~ "Yes",
+    voted == 2 ~ "No",
+    T ~ "Unknown"
+  ))
+```
+
+### Marriage
+
+```{r DT Marriage}
+data <- data %>% 
+  mutate(married = case_when(
+    married == 1 ~ "Never married",
+    married == 2 ~ "Currently married",
+    married == 3 ~ "Previously married",
+    T ~ "Unknown"
+  ))
+```
+
+# Splitting Data
+
+```{r Data Splits}
+set.seed(322)
+split <- initial_split(data, prop = .75)
+trainData <- training(split)
+testData <- testing(split)
+training_folds <- vfold_cv(trainData, v = 10)
+```
+
+# Linear Models
+
+**Note:** This section is mostly a recap of work done in `Scratch Work.Rmd`.
+
+## Stress
+
+### Stress Scale Predictors
+
+```{r Linear Stress}
+summary(lm(stress_score ~ Q1A, trainData)) # Sig, 7.780
+summary(lm(stress_score ~ Q6A, trainData)) # Sig, 7.251
+summary(lm(stress_score ~ Q8A, trainData)) # Sig, 7.259
+summary(lm(stress_score ~ Q11A, trainData)) # Sig, 7.782
+summary(lm(stress_score ~ Q12A, trainData)) # Sig, 6.982
+summary(lm(stress_score ~ Q14A, trainData)) # Sig, 6.092
+summary(lm(stress_score ~ Q18A, trainData)) # Sig, 6.302
+summary(lm(stress_score ~ Q22A, trainData)) # Sig, 7.403
+summary(lm(stress_score ~ Q27A, trainData)) # Sig, 7.580
+summary(lm(stress_score ~ Q29A, trainData)) # Sig, 7.531
+summary(lm(stress_score ~ Q32A, trainData)) # Sig, 7.231
+summary(lm(stress_score ~ Q33A, trainData)) # Sig, 7.138
+summary(lm(stress_score ~ Q35A, trainData)) # Sig, 7.283
+summary(lm(stress_score ~ Q39A, trainData)) # Sig, 7.705
+# Overall: biggest = Q1A, Q11A; smallest = Q14A, Q18A
+```
+
+```{r Linear Stress Trans}
+summary(lm(stress_trans ~ Q1A, trainData)) # Sig, 4.207
+summary(lm(stress_trans ~ Q6A, trainData)) # Sig, 3.913
+summary(lm(stress_trans ~ Q8A, trainData)) # Sig, 3.914
+summary(lm(stress_trans ~ Q11A, trainData)) # Sig, 4.236
+summary(lm(stress_trans ~ Q12A, trainData)) # Sig, 3.762
+summary(lm(stress_trans ~ Q14A, trainData)) # Sig, 3.291
+summary(lm(stress_trans ~ Q18A, trainData)) # Sig, 3.404
+summary(lm(stress_trans ~ Q22A, trainData)) # Sig, 3.978
+summary(lm(stress_trans ~ Q27A, trainData)) # Sig, 4.100
+summary(lm(stress_trans ~ Q29A, trainData)) # Sig, 4.081
+summary(lm(stress_trans ~ Q32A, trainData)) # Sig, 3.894
+summary(lm(stress_trans ~ Q33A, trainData)) # Sig, 3.843
+summary(lm(stress_trans ~ Q35A, trainData)) # Sig, 3.910
+summary(lm(stress_trans ~ Q39A, trainData)) # Sig, 4.148
+# Overall: biggest = Q1A, Q11A; smallest = Q14A, Q18A
+```
+
+### Other Scale Predictors
+
+```{r Linear Stress Other}
+summary(lm(stress_score ~ anxiety_score + depression_score, trainData)) # Both sig, anxiety bigger estimate
+summary(lm(stress_score ~ anxiety_score, trainData)) # Sig, 0.822
+summary(lm(stress_score ~ depression_score, trainData)) # Sig, 0.629
+
+summary(lm(stress_score ~ Q2A + Q3A + Q4A + Q5A + Q7A + Q9A + Q10A + Q13A +
+             Q15A + Q16A + Q17A + Q19A + Q20A + Q21A + Q23A + Q24A + Q25A + 
+             Q26A + Q28A + Q30A + Q31A + Q34A + Q36A + Q37A + Q38A + Q40A +
+             Q41A + Q42A, trainData)) # Not significant: Q10A, Q16A, Q21A, Q34A
+# Less significant: Q38A, Q41A
+# Rsq = 0.7451, adj rsq = 0.7449, F(28, 29802) = 3111, p < .001
+plot(lm(stress_score ~ Q2A + Q3A + Q4A + Q5A + Q7A + Q9A + Q10A + Q13A +
+             Q15A + Q16A + Q17A + Q19A + Q20A + Q21A + Q23A + Q24A + Q25A + 
+             Q26A + Q28A + Q30A + Q31A + Q34A + Q36A + Q37A + Q38A + Q40A +
+             Q41A + Q42A, trainData))
+# Some not great trends in residuals and weird patterns in scale-location
+
+summary(lm(stress_score ~ Q10A, trainData)) # Sig, 5.191
+summary(lm(stress_score ~ Q16A, trainData)) # Sig, 5.452
+summary(lm(stress_score ~ Q21A, trainData)) # Sig, 5.304
+summary(lm(stress_score ~ Q34A, trainData)) # Sig, 5.509
+summary(lm(stress_score ~ Q38A, trainData)) # Sig, 5.020
+summary(lm(stress_score ~ Q41A, trainData)) # Sig, 5.171
+
+
+summary(lm(stress_score ~ Q9A + Q13A + Q28A + Q30A + Q40A, trainData)) # 5 biggest predictors
+# Rsq = 0.6859, adj rsq = 0.6858, F(5, 29825) = 13020, p < .001
+# Everything significant, Q13A and then Q28A are the biggest predictors
+plot(lm(stress_score ~ Q9A + Q13A + Q28A + Q30A + Q40A, trainData))
+# Diagnostics are about the same as before, not much to worry about
+# This model explains 92% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 5 instead of 28 predictors. This is encouraging!
+```
+
+```{r Linear Stress Trans Other}
+summary(lm(stress_trans ~ anxiety_score + depression_score, trainData)) # Both sig, anxiety bigger estimate
+summary(lm(stress_trans ~ anxiety_score, trainData)) # Sig, 0.441
+summary(lm(stress_trans ~ depression_score, trainData)) # Sig, 0.340
+summary(lm(stress_trans ~ anxiety_trans, trainData)) # Sig, 3.195, slightly better rsq
+summary(lm(stress_trans ~ depression_trans, trainData)) # Sig, 0.785, slightly better rsq
+summary(lm(stress_trans ~ depression_trans_2, trainData)) # Sig, 2.674, better than untrans but worst than first trans (slightly)
+summary(lm(stress_trans ~ anxiety_trans + depression_trans, trainData)) # Both sig, anxiety way higher (they aren't on the same scale), rsq def better (.7208 > .7078)
+# Rsq of untransformed model: higher than stress predicted by untransformed, lower than predictions of transformed
+
+summary(lm(stress_trans ~ Q2A + Q3A + Q4A + Q5A + Q7A + Q9A + Q10A + Q13A +
+             Q15A + Q16A + Q17A + Q19A + Q20A + Q21A + Q23A + Q24A + Q25A + 
+             Q26A + Q28A + Q30A + Q31A + Q34A + Q36A + Q37A + Q38A + Q40A +
+             Q41A + Q42A, trainData)) # Not significant: Q10A, Q21A, Q34A
+# Less significant: Q16A, Q41A
+# Rsq = 0.7405, adj rsq = 0.7403, F(28, 29802) = 3037, p < .001
+plot(lm(stress_trans ~ Q2A + Q3A + Q4A + Q5A + Q7A + Q9A + Q10A + Q13A +
+             Q15A + Q16A + Q17A + Q19A + Q20A + Q21A + Q23A + Q24A + Q25A + 
+             Q26A + Q28A + Q30A + Q31A + Q34A + Q36A + Q37A + Q38A + Q40A +
+             Q41A + Q42A, trainData))
+# About the same or overall slightly worse than the untransformed
+# Overall, this model just seems worse
+
+summary(lm(stress_trans ~ Q10A, trainData)) # Sig, 2.804
+summary(lm(stress_trans ~ Q16A, trainData)) # Sig, 2.950
+summary(lm(stress_trans ~ Q21A, trainData)) # Sig, 2.855
+summary(lm(stress_trans ~ Q34A, trainData)) # Sig, 2.990
+summary(lm(stress_trans ~ Q38A, trainData)) # Sig, 2.705
+summary(lm(stress_trans ~ Q41A, trainData)) # Sig, 2.766
+
+
+summary(lm(stress_trans ~ Q9A + Q13A + Q28A + Q30A + Q40A, trainData)) # 5 biggest predictors
+# Rsq = 0.6857, adj rsq = 0.6856, F(5, 29825) = 13010, p < .001
+# Everything significant, Q13A and then Q28A are the biggest predictors
+# About equivalent to untransformed
+plot(lm(stress_trans ~ Q9A + Q13A + Q28A + Q30A + Q40A, trainData))
+# Diagnostics are about the same as before, not much to worry about
+# This model explains 93% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 5 instead of 28 predictors. This is encouraging!
+```
+
+### Demographic Predictors
+
+```{r Linear Stress Dem}
+summary(lm(stress_score ~ education, trainData)) # Overall sig, rsq of like 0.02 tho
+summary(lm(stress_score ~ orientation, trainData)) # Overall sig, again rsq of like 0.015
+summary(lm(stress_score ~ race, trainData)) # Overall sig, rsq = 0.002
+summary(lm(stress_score ~ urban, trainData)) # Overall sig, rsq = 0.001
+summary(lm(stress_score ~ gender, trainData)) # Overall sig, rsq = 0.02
+summary(lm(stress_score ~ age, trainData)) # Overall sig, rsq = 0.004
+summary(lm(stress_score ~ voted, trainData)) # Overall sig, rsq = 0.01
+summary(lm(stress_score ~ married, trainData)) # Overall sig, rsq = 0.01
+summary(lm(stress_score ~ familysize, trainData)) # Overall sig, rsq = 0.0007
+summary(lm(stress_score ~ country_simp, trainData)) # Overall sig, rsq = 0.003
+
+summary(lm(stress_score ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)) # Overall sig, rsq = 0.06
+# Only variables sig are education, orientation, race, gender, voting, marriage, country
+```
+
+```{r Linear Stress Trans Dem}
+summary(lm(stress_trans ~ education, trainData)) # Overall sig, rsq of like 0.02 tho
+summary(lm(stress_trans ~ orientation, trainData)) # Overall sig, again rsq of like 0.015
+summary(lm(stress_trans ~ race, trainData)) # Overall sig, rsq = 0.002
+summary(lm(stress_trans ~ urban, trainData)) # Overall sig, rsq = 0.001
+summary(lm(stress_trans ~ gender, trainData)) # Overall sig, rsq = 0.02
+summary(lm(stress_trans ~ age, trainData)) # Overall sig, rsq = 0.004
+summary(lm(stress_trans ~ voted, trainData)) # Overall sig, rsq = 0.01
+summary(lm(stress_trans ~ married, trainData)) # Overall sig, rsq = 0.01
+summary(lm(stress_trans ~ familysize, trainData)) # Overall sig, rsq = 0.0007
+summary(lm(stress_trans ~ country_simp, trainData)) # Overall sig, rsq = 0.003
+
+summary(lm(stress_trans ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)) # Overall sig, rsq = 0.06
+# Only variables sig are education, orientation, race, gender, voting, marriage, country
+```
+
+
+### Personality
+
+```{r Linear Stress Personality}
+summary(lm(stress_score ~ extraversion, trainData)) # Sig, rsq = 0.03
+summary(lm(stress_score ~ agreeableness, trainData)) # Sig, rsq = 0.04
+summary(lm(stress_score ~ conscientiousness, trainData)) # Sig, rsq = 0.05
+summary(lm(stress_score ~ emotional_stability, trainData)) # Sig, rsq = 0.42 (not a typo)
+summary(lm(stress_score ~ openness, trainData)) # Sig, rsq = 0.04
+
+summary(lm(stress_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData)) # Sig, rsq = 0.43 (might as well just use emotional stability / neuroticism)
+plot(lm(stress_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData))
+# Assumptions slightly worse and patterns even more egregious, but overall not awful
+
+plot(lm(stress_score ~ emotional_stability, trainData))
+# Definite trends in the residuals
+```
+
+```{r Linear Stress Personality}
+summary(lm(stress_trans ~ extraversion, trainData)) # Sig, rsq = 0.03
+summary(lm(stress_trans ~ agreeableness, trainData)) # Sig, rsq = 0.04
+summary(lm(stress_trans ~ conscientiousness, trainData)) # Sig, rsq = 0.05
+summary(lm(stress_trans ~ emotional_stability, trainData)) # Sig, rsq = 0.44 (not a typo)
+summary(lm(stress_trans ~ openness, trainData)) # Sig, rsq = 0.04
+
+summary(lm(stress_trans ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData)) # Sig, rsq = 0.45 (might as well just use emotional stability / neuroticism)
+plot(lm(stress_trans ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData))
+# Roughly the same as untransformed
+
+plot(lm(stress_trans ~ emotional_stability, trainData))
+# Not too terrible
+```
+
+### Good Simple Model
+
+```{r Linear Stress Good Simple Model}
+summary(lm(stress_score ~ Q9A + Q13A + Q28A + Q30A + Q40A +
+             emotional_stability, trainData)) # Rsq = adj rsq = 0.7233, F(6, 29396) = 12810, p < .001
+# Substantial improvement when we throw in emotional stability as a predictor
+
+plot(lm(stress_score ~ Q9A + Q13A + Q28A + Q30A + Q40A +
+             emotional_stability, trainData))
+# Slightly better I think
+
+summary(lm(stress_trans ~ Q9A + Q13A + Q18A + Q30A + Q40A + 
+             emotional_stability, trainData)) # Rsq = adj rsq = 0.7666, F(6, 29396) = 16090, p < .001
+# Outperforms untransformed model
+
+plot(lm(stress_trans ~ Q9A + Q13A + Q18A + Q30A + Q40A + 
+             emotional_stability, trainData))
+# About the same
+```
+
+### Do these improve beyond best predictors of its own scale?
+
+```{r Linear Stress Mixed}
+summary(lm(stress_score ~ Q1A + Q11A + Q9A + Q13A + Q18A + Q30A + Q40A +
+             emotional_stability, trainData)) # Everything sig, rsq = 0.8355 = adj rsq
+# We can probably throw in more from its own scale, but we want to keep these as small as possible
+
+plot(lm(stress_score ~ Q1A + Q11A + Q9A + Q13A + Q18A + Q30A + Q40A +
+             emotional_stability, trainData)) # Slightly better
+
+summary(lm(stress_trans ~ Q1A + Q11A + Q9A + Q13A + Q18A + Q30A + Q40A +
+             emotional_stability, trainData)) # Everything sig, rsq = adj rsq = 0.8405
+
+plot(lm(stress_trans ~ Q1A + Q11A + Q9A + Q13A + Q18A + Q30A + Q40A +
+             emotional_stability, trainData))
+
+# Ever so slightly better
+```
+
+
+## Anxiety
+
+### Anxiety Scale Predictors
+
+```{r Linear Anxiety}
+summary(lm(anxiety_score ~ Q2A, trainData)) # Sig, 5.255
+summary(lm(anxiety_score ~ Q4A, trainData)) # Sig, 7.115
+summary(lm(anxiety_score ~ Q7A, trainData)) # Sig, 7.385
+summary(lm(anxiety_score ~ Q9A, trainData)) # Sig, 6.743
+summary(lm(anxiety_score ~ Q15A, trainData)) # Sig, 6.917
+summary(lm(anxiety_score ~ Q19A, trainData)) # Sig, 5.942
+summary(lm(anxiety_score ~ Q20A, trainData)) # Sig, 6.818
+summary(lm(anxiety_score ~ Q23A, trainData)) # Sig, 7.479
+summary(lm(anxiety_score ~ Q25A, trainData)) # Sig, 6.536
+summary(lm(anxiety_score ~ Q28A, trainData)) # Sig, 7.286
+summary(lm(anxiety_score ~ Q30A, trainData)) # Sig, 6.366
+summary(lm(anxiety_score ~ Q36A, trainData)) # Sig, 6.838
+summary(lm(anxiety_score ~ Q40A, trainData)) # Sig, 6.511
+summary(lm(anxiety_score ~ Q41A, trainData)) # Sig, 7.016
+# Biggest: Q23A, Q7A
+# Smallest: Q2A, Q19A
+```
+
+```{r Linear Anxiety Trans}
+summary(lm(anxiety_trans ~ Q2A, trainData)) # Sig, 0.718
+summary(lm(anxiety_trans ~ Q4A, trainData)) # Sig, 0.935
+summary(lm(anxiety_trans ~ Q7A, trainData)) # Sig, 0.967
+summary(lm(anxiety_trans ~ Q9A, trainData)) # Sig, 0.966
+summary(lm(anxiety_trans ~ Q15A, trainData)) # Sig, 0.901
+summary(lm(anxiety_trans ~ Q19A, trainData)) # Sig, 0.788
+summary(lm(anxiety_trans ~ Q20A, trainData)) # Sig, 0.936
+summary(lm(anxiety_trans ~ Q23A, trainData)) # Sig, 0.948
+summary(lm(anxiety_trans ~ Q25A, trainData)) # Sig, 0.883
+summary(lm(anxiety_trans ~ Q28A, trainData)) # Sig, 0.988
+summary(lm(anxiety_trans ~ Q30A, trainData)) # Sig, 0.890
+summary(lm(anxiety_trans ~ Q36A, trainData)) # Sig, 0.933
+summary(lm(anxiety_trans ~ Q40A, trainData)) # Sig, 0.930
+summary(lm(anxiety_trans ~ Q41A, trainData)) # Sig, 0.925
+# Biggest: Q28A, Q7A, Q9A
+# Smallest: Q2A, Q19A
+```
+
+### Other Scale Predictors
+
+```{r Linear Anxiety Other}
+summary(lm(anxiety_score ~ stress_score + depression_score, trainData)) # Both sig, stress bigger estimate
+summary(lm(anxiety_score ~ stress_score, trainData)) # Sig, 0.781
+summary(lm(anxiety_score ~ depression_score, trainData)) # Sig, 0.557
+
+summary(lm(anxiety_score ~ Q1A + Q3A + Q5A + Q6A + Q8A + Q10A + Q11A + Q12A +
+             Q13A + Q14A + Q16A + Q17A + Q18A + Q21A + Q22A + Q24A + Q26A +
+             Q27A + Q29A + Q31A + Q32A + Q33A + Q34A + Q35A + Q37A + Q38A +
+             Q39A + Q42A, trainData)) # Not significant: Q3A, Q5A, Q10A, Q11A, Q13A, Q24A, Q27A, Q31A, Q38A, Q42A
+# Less significant: Q26A, Q37A
+# Rsq = 0.7024, adj rsq = 0.7022, F(28, 29802) = 2513, p < .001
+plot(lm(anxiety_score ~ Q1A + Q3A + Q5A + Q6A + Q8A + Q10A + Q11A + Q12A +
+             Q13A + Q14A + Q16A + Q17A + Q18A + Q21A + Q22A + Q24A + Q26A +
+             Q27A + Q29A + Q31A + Q32A + Q33A + Q34A + Q35A + Q37A + Q38A +
+             Q39A + Q42A, trainData))
+# A little worse
+
+summary(lm(anxiety_score ~ Q3A, trainData)) # Sig, 5.194
+summary(lm(anxiety_score ~ Q5A, trainData)) # Sig, 5.147
+summary(lm(anxiety_score ~ Q10A, trainData)) # Sig, 4.613
+summary(lm(anxiety_score ~ Q11A, trainData)) # Sig, 5.694
+summary(lm(anxiety_score ~ Q13A, trainData)) # Sig, 5.567
+summary(lm(anxiety_score ~ Q24A, trainData)) # Sig, 5.070
+summary(lm(anxiety_score ~ Q27A, trainData)) # Sig, 5.404
+summary(lm(anxiety_score ~ Q31A, trainData)) # Sig, 4.975
+summary(lm(anxiety_score ~ Q38A, trainData)) # Sig, 4.975
+summary(lm(anxiety_score ~ Q42A, trainData)) # Sig, 4.729
+
+
+summary(lm(anxiety_score ~ Q33A + Q12A + Q14A + Q29A, trainData)) # 4 biggest predictors
+# Rsq = 0.6424 = adj rsq, F(4, 29826) = 13400, p < .001
+# Everything significant, Q33A and then Q12A are the biggest predictors
+plot(lm(anxiety_score ~ Q33A + Q12A + Q14A + Q29A, trainData))
+# Diagnostics are ugly
+# This model explains 91% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 4 instead of 28 predictors.
+```
+
+```{r Linear Anxiety Trans Other}
+summary(lm(anxiety_trans ~ stress_score + depression_score, trainData)) # Both sig, stress bigger estimate
+summary(lm(anxiety_trans ~ stress_score, trainData)) # Sig, 0.109
+summary(lm(anxiety_trans ~ depression_score, trainData)) # Sig, 0.077
+summary(lm(anxiety_trans ~ stress_trans, trainData)) # Sig, 0.202, better
+summary(lm(anxiety_trans ~ depression_trans, trainData)) # Sig, 0.179, better
+summary(lm(anxiety_trans ~ depression_trans_2, trainData)) # Sig, 0.612, better than both
+summary(lm(anxiety_trans ~ stress_trans + depression_trans_2, trainData)) # Sig, slightly better, stress slightly bigger
+
+summary(lm(anxiety_trans ~ Q1A + Q3A + Q5A + Q6A + Q8A + Q10A + Q11A + Q12A +
+             Q13A + Q14A + Q16A + Q17A + Q18A + Q21A + Q22A + Q24A + Q26A +
+             Q27A + Q29A + Q31A + Q32A + Q33A + Q34A + Q35A + Q37A + Q38A +
+             Q39A + Q42A, trainData)) # Not significant: Q5A, Q10A, Q24A, Q27A, Q31A, Q38A, Q42A
+# Less significant: Q26A, Q37A
+# Rsq = 0.6954, adj rsq = 0.6951, F(28, 29802) = 2430, p < .001
+plot(lm(anxiety_trans ~ Q1A + Q3A + Q5A + Q6A + Q8A + Q10A + Q11A + Q12A +
+             Q13A + Q14A + Q16A + Q17A + Q18A + Q21A + Q22A + Q24A + Q26A +
+             Q27A + Q29A + Q31A + Q32A + Q33A + Q34A + Q35A + Q37A + Q38A +
+             Q39A + Q42A, trainData))
+# Really some trends now
+
+summary(lm(anxiety_trans ~ Q5A, trainData)) # Sig, 0.711
+summary(lm(anxiety_trans ~ Q10A, trainData)) # Sig, 0.638
+summary(lm(anxiety_trans ~ Q24A, trainData)) # Sig, 0.699
+summary(lm(anxiety_trans ~ Q27A, trainData)) # Sig, 0.757
+summary(lm(anxiety_trans ~ Q31A, trainData)) # Sig, 0.683
+summary(lm(anxiety_trans ~ Q38A, trainData)) # Sig, 0.625
+summary(lm(anxiety_trans ~ Q42A, trainData)) # Sig, 0.661
+
+
+summary(lm(anxiety_trans ~ Q33A + Q12A + Q14A + Q29A, trainData)) # 4 biggest predictors
+# Rsq = 0.6351, adj rsq = .635, F(4, 29826) = 12980, p < .001
+# Everything significant, Q33A and then Q12A are the biggest predictors
+plot(lm(anxiety_trans ~ Q33A + Q12A + Q14A + Q29A, trainData))
+# Diagnostics are ugly
+# This model explains 91% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 4 instead of 28 predictors.
+```
+
+### Demographic Predictors
+
+```{r Linear Anxiety Dem}
+summary(lm(anxiety_score ~ education, trainData)) # Overall sig, rsq of like 0.03 tho
+summary(lm(anxiety_score ~ orientation, trainData)) # Overall sig, again rsq of like 0.025
+summary(lm(anxiety_score ~ race, trainData)) # Overall sig, rsq = 0.004
+summary(lm(anxiety_score ~ urban, trainData)) # Overall sig, rsq = 0.002
+summary(lm(anxiety_score ~ gender, trainData)) # Overall sig, rsq = 0.02
+summary(lm(anxiety_score ~ age, trainData)) # Overall sig, rsq = 0.009
+summary(lm(anxiety_score ~ voted, trainData)) # Overall sig, rsq = 0.02
+summary(lm(anxiety_score ~ married, trainData)) # Overall sig, rsq = 0.03
+summary(lm(anxiety_score ~ familysize, trainData)) # Overall sig, rsq = 0.00006
+summary(lm(anxiety_score ~ country_simp, trainData)) # Overall sig, rsq = 0.005
+
+summary(lm(anxiety_score ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)) # Overall sig, rsq = 0.09
+# Only variables sig are education, orientation, race, gender, age, voting, marriage, country
+```
+
+```{r Linear Anxiety Trans Dem}
+summary(lm(anxiety_trans ~ education, trainData)) # Overall sig, rsq of like 0.03 tho
+summary(lm(anxiety_trans ~ orientation, trainData)) # Overall sig, again rsq of like 0.025
+summary(lm(anxiety_trans ~ race, trainData)) # Overall sig, rsq = 0.006
+summary(lm(anxiety_trans ~ urban, trainData)) # Overall sig, rsq = 0.002
+summary(lm(anxiety_trans ~ gender, trainData)) # Overall sig, rsq = 0.02
+summary(lm(anxiety_trans ~ age, trainData)) # Overall sig, rsq = 0.01
+summary(lm(anxiety_trans ~ voted, trainData)) # Overall sig, rsq = 0.03
+summary(lm(anxiety_trans ~ married, trainData)) # Overall sig, rsq = 0.04
+summary(lm(anxiety_trans ~ familysize, trainData)) # Overall sig, rsq = 0.0001
+summary(lm(anxiety_trans ~ country_simp, trainData)) # Overall sig, rsq = 0.007
+
+summary(lm(anxiety_trans ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)) # Overall sig, rsq = 0.1
+# Only variables sig are education, orientation, race, gender, age, voting, marriage, country
+```
+
+### Personality
+
+```{r Linear Anxiety Personality}
+summary(lm(anxiety_score ~ extraversion, trainData)) # Sig, rsq = 0.04
+summary(lm(anxiety_score ~ agreeableness, trainData)) # Sig, rsq = 0.01
+summary(lm(anxiety_score ~ conscientiousness, trainData)) # Sig, rsq = 0.05
+summary(lm(anxiety_score ~ emotional_stability, trainData)) # Sig, rsq = 0.29
+summary(lm(anxiety_score ~ openness, trainData)) # Sig, rsq = 0.04
+
+summary(lm(anxiety_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData)) # Sig, rsq = 0.31 (might as well just use emotional stability / neuroticism)
+plot(lm(anxiety_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData))
+# Little worse
+
+plot(lm(anxiety_score ~ emotional_stability, trainData))
+# Definite trends in the residuals, arguably better than with all of personality though
+```
+
+```{r Linear Anxiety Trans Personality}
+summary(lm(anxiety_trans ~ extraversion, trainData)) # Sig, rsq = 0.04
+summary(lm(anxiety_trans ~ agreeableness, trainData)) # Sig, rsq = 0.01
+summary(lm(anxiety_trans ~ conscientiousness, trainData)) # Sig, rsq = 0.06
+summary(lm(anxiety_trans ~ emotional_stability, trainData)) # Sig, rsq = 0.32
+summary(lm(anxiety_trans ~ openness, trainData)) # Sig, rsq = 0.05
+
+summary(lm(anxiety_trans ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData)) # Sig, rsq = 0.34 (might as well just use emotional stability / neuroticism)
+plot(lm(anxiety_trans ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData))
+# Little worse
+
+plot(lm(anxiety_trans ~ emotional_stability, trainData))
+# Not too terrible
+```
+
+### Good Simple Model
+
+```{r Linear Anxiety Good Simple Model}
+summary(lm(anxiety_score ~ Q33A + Q12A + Q14A + Q29A +
+             emotional_stability, trainData)) # Rsq = 0.6482, adj rsq = 0.6481, F(5, 29397) = 10830, p < .001
+# Not much improvement with emotional stability
+
+plot(lm(anxiety_score ~ Q33A + Q12A + Q14A + Q29A +
+             emotional_stability, trainData))
+# She's not pretty
+
+summary(lm(anxiety_trans ~ Q33A + Q12A + Q14A + Q29A +
+             emotional_stability, trainData)) # Rsq = adj rsq = 0.6471, F(5, 29397) = 10780, p < .001
+# No improvement over untransformed
+
+plot(lm(anxiety_trans ~ Q33A + Q12A + Q14A + Q29A +
+             emotional_stability, trainData))
+# Maybe a little better?
+```
+
+### Do these improve beyond best predictors of its own scale?
+
+```{r Linear Anxiety Mixed}
+summary(lm(anxiety_score ~ Q23A + Q7A + Q33A + Q12A + Q14A + Q29A +
+             emotional_stability, trainData)) # Everything sig, rsq = 0.8167, adj rsq = 0.8166
+# We can probably throw in more from its own scale, but we want to keep these as small as possible
+
+plot(lm(anxiety_score ~ Q23A + Q7A + Q33A + Q12A + Q14A + Q29A +
+             emotional_stability, trainData)) # Somewhat better
+
+summary(lm(anxiety_trans ~ Q28A + Q7A + Q8A + Q33A + Q12A + Q14A + Q29A +
+             emotional_stability, trainData)) # Everything sig, rsq = adj rsq = 0.7771
+
+plot(lm(anxiety_trans ~ Q28A + Q7A + Q8A + Q33A + Q12A + Q14A + Q29A +
+             emotional_stability, trainData))
+# Ever so slightly better
+```
+
+## Depression
+
+### Depression Scale Predictors
+
+```{r Linear Depression}
+summary(lm(depression_score ~ Q3A, trainData)) # Sig, 9.399
+summary(lm(depression_score ~ Q5A, trainData)) # Sig, 8.811
+summary(lm(depression_score ~ Q10A, trainData)) # Sig, 8.967
+summary(lm(depression_score ~ Q13A, trainData)) # Sig, 9.344
+summary(lm(depression_score ~ Q16A, trainData)) # Sig, 8.905
+summary(lm(depression_score ~ Q17A, trainData)) # Sig, 8.651
+summary(lm(depression_score ~ Q21A, trainData)) # Sig, 8.940
+summary(lm(depression_score ~ Q24A, trainData)) # Sig, 9.145
+summary(lm(depression_score ~ Q26A, trainData)) # Sig, 9.069
+summary(lm(depression_score ~ Q31A, trainData)) # Sig, 9.116
+summary(lm(depression_score ~ Q34A, trainData)) # Sig, 8.790
+summary(lm(depression_score ~ Q37A, trainData)) # Sig, 8.714
+summary(lm(depression_score ~ Q38A, trainData)) # Sig, 8.691
+summary(lm(depression_score ~ Q42A, trainData)) # Sig, 8.096
+# Biggest: Q3A, Q13A
+# Smallest: Q42A
+```
+
+```{r Linear Depression Trans}
+summary(lm(depression_trans ~ Q3A, trainData)) # Sig, 4.042
+summary(lm(depression_trans ~ Q5A, trainData)) # Sig, 3.844
+summary(lm(depression_trans ~ Q10A, trainData)) # Sig, 3.884
+summary(lm(depression_trans ~ Q13A, trainData)) # Sig, 4.123
+summary(lm(depression_trans ~ Q16A, trainData)) # Sig, 3.881
+summary(lm(depression_trans ~ Q17A, trainData)) # Sig, 3.793
+summary(lm(depression_trans ~ Q21A, trainData)) # Sig, 3.845
+summary(lm(depression_trans ~ Q24A, trainData)) # Sig, 3.976
+summary(lm(depression_trans ~ Q26A, trainData)) # Sig, 3.983
+summary(lm(depression_trans ~ Q31A, trainData)) # Sig, 3.954
+summary(lm(depression_trans ~ Q34A, trainData)) # Sig, 3.846
+summary(lm(depression_trans ~ Q37A, trainData)) # Sig, 3.761
+summary(lm(depression_trans ~ Q38A, trainData)) # Sig, 3.745
+summary(lm(depression_trans ~ Q42A, trainData)) # Sig, 3.566
+# Biggest: Q3A, Q13A
+# Smallest: Q42A
+```
+
+```{r Linear Depression Trans 2}
+summary(lm(depression_trans_2 ~ Q3A, trainData)) # Sig, 1.148
+summary(lm(depression_trans_2 ~ Q5A, trainData)) # Sig, 1.106
+summary(lm(depression_trans_2 ~ Q10A, trainData)) # Sig, 1.109
+summary(lm(depression_trans_2 ~ Q13A, trainData)) # Sig, 1.198
+summary(lm(depression_trans_2 ~ Q16A, trainData)) # Sig, 1.115
+summary(lm(depression_trans_2 ~ Q17A, trainData)) # Sig, 1.094
+summary(lm(depression_trans_2 ~ Q21A, trainData)) # Sig, 1.090
+summary(lm(depression_trans_2 ~ Q24A, trainData)) # Sig, 1.141
+summary(lm(depression_trans_2 ~ Q26A, trainData)) # Sig, 1.153
+summary(lm(depression_trans_2 ~ Q31A, trainData)) # Sig, 1.132
+summary(lm(depression_trans_2 ~ Q34A, trainData)) # Sig, 1.108
+summary(lm(depression_trans_2 ~ Q37A, trainData)) # Sig, 1.071
+summary(lm(depression_trans_2 ~ Q38A, trainData)) # Sig, 1.064
+summary(lm(depression_trans_2 ~ Q42A, trainData)) # Sig, 1.038
+# Biggest: Q26A, Q13A
+# Smallest: Q42A
+```
+
+### Other Scale Predictors
+
+```{r Linear Depression Other}
+summary(lm(depression_score ~ stress_score + anxiety_score, trainData)) # Both sig, stress bigger estimate
+summary(lm(depression_score ~ stress_score, trainData)) # Sig, 0.866
+summary(lm(depression_score ~ anxiety_score, trainData)) # Sig, 0.804
+
+summary(lm(depression_score ~ Q1A + Q2A + Q4A + Q6A + Q7A + Q8A + Q9A + Q11A + 
+             Q12A + Q14A + Q15A + Q18A + Q19A + Q20A + Q22A + Q23A + Q25A +
+             Q27A + Q28A + Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A + 
+             Q40A + Q41A, trainData)) # Not significant: Q4A, Q7A, Q9A, Q19A, Q25A, Q41A
+# Less significant: Q12A
+# Rsq = 0.6037, adj rsq = 0.6034, F(28, 29802) = 1622, p < .001
+plot(lm(depression_score ~ Q1A + Q2A + Q4A + Q6A + Q7A + Q8A + Q9A + Q11A + 
+             Q12A + Q14A + Q15A + Q18A + Q19A + Q20A + Q22A + Q23A + Q25A +
+             Q27A + Q28A + Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A + 
+             Q40A + Q41A, trainData))
+# Still not great
+
+summary(lm(depression_score ~ Q4A, trainData)) # Sig, 5.178
+summary(lm(depression_score ~ Q7A, trainData)) # Sig, 5.285
+summary(lm(depression_score ~ Q9A, trainData)) # Sig, 5.688
+summary(lm(depression_score ~ Q19A, trainData)) # Sig, 4.056
+summary(lm(depression_score ~ Q25A, trainData)) # Sig, 4.685
+summary(lm(depression_score ~ Q41A, trainData)) # Sig, 4.900
+summary(lm(depression_score ~ Q12A, trainData)) # Sig, 5.962
+
+
+summary(lm(depression_score ~ Q8A + Q11A + Q22A + Q27A + Q36A, trainData)) # 5 biggest predictors
+# Rsq = 0.5639, adj rsq = 0.5638, F(5, 29825) = 7712, p < .001
+# Everything significant, Q36A and then Q11A are the biggest predictors
+plot(lm(depression_score ~ Q8A + Q11A + Q22A + Q27A + Q36A, trainData))
+# Diagnostics are ugly
+# This model explains 93% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 5 instead of 28 predictors.
+```
+
+```{r Linear Depression Trans Other}
+summary(lm(depression_trans ~ stress_score + anxiety_score, trainData)) # Both sig, stress bigger estimate
+summary(lm(depression_trans ~ stress_score, trainData)) # Sig, 0.381
+summary(lm(depression_trans ~ anxiety_score, trainData)) # Sig, 0.351
+summary(lm(depression_trans ~ anxiety_trans, trainData)) # Sig, 2.550
+summary(lm(depression_trans ~ stress_trans, trainData)) # Sig, 0.708
+summary(lm(depression_trans ~ stress_trans + anxiety_trans, trainData)) # Both sig, anxiety bigger estimate (they are not on the same scale)
+
+summary(lm(depression_trans ~ Q1A + Q2A + Q4A + Q6A + Q7A + Q8A + Q9A + Q11A + 
+             Q12A + Q14A + Q15A + Q18A + Q19A + Q20A + Q22A + Q23A + Q25A +
+             Q27A + Q28A + Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A + 
+             Q40A + Q41A, trainData)) # Not significant: Q4A, Q7A, Q12A, Q19A, Q25A, Q41A
+# Less significant: Q9A
+# Rsq = 0.605, adj rsq = 0.6046, F(28, 29802) = 1630, p < .001
+plot(lm(depression_trans ~ Q1A + Q2A + Q4A + Q6A + Q7A + Q8A + Q9A + Q11A + 
+             Q12A + Q14A + Q15A + Q18A + Q19A + Q20A + Q22A + Q23A + Q25A +
+             Q27A + Q28A + Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A + 
+             Q40A + Q41A, trainData))
+# About the same
+
+summary(lm(depression_trans ~ Q4A, trainData)) # Sig, 2.242
+summary(lm(depression_trans ~ Q7A, trainData)) # Sig, 2.289
+summary(lm(depression_trans ~ Q9A, trainData)) # Sig, 2.528
+summary(lm(depression_trans ~ Q19A, trainData)) # Sig, 1.762
+summary(lm(depression_trans ~ Q25A, trainData)) # Sig, 2.043
+summary(lm(depression_trans ~ Q41A, trainData)) # Sig, 2.127
+summary(lm(depression_trans ~ Q12A, trainData)) # Sig, 2.623
+
+
+summary(lm(depression_trans ~ Q8A + Q11A + Q22A + Q27A + Q36A, trainData)) # 5 biggest predictors
+# Rsq = 0.5668, adj rsq = 0.5667, F(5, 29825) = 7805, p < .001
+# Everything significant, Q11A and then Q36A are the biggest predictors
+plot(lm(depression_trans ~ Q8A + Q11A + Q22A + Q27A + Q36A, trainData))
+# Diagnostics are about the same
+# This model explains 94% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 5 instead of 28 predictors.
+```
+
+```{r Linear Depression Trans 2 Other}
+summary(lm(depression_trans_2 ~ stress_score + anxiety_score, trainData)) # Both sig, stress bigger estimate
+summary(lm(depression_trans_2 ~ stress_score, trainData)) # Sig, 0.111
+summary(lm(depression_trans_2 ~ anxiety_score, trainData)) # Sig, 0.101
+summary(lm(depression_trans_2 ~ anxiety_trans, trainData)) # Sig, 0.749
+summary(lm(depression_trans_2 ~ stress_trans, trainData)) # Sig, 0.207
+summary(lm(depression_trans_2 ~ stress_trans + anxiety_trans, trainData)) # Both sig, anxiety bigger estimate (they are not on the same scale)
+
+summary(lm(depression_trans_2 ~ Q1A + Q2A + Q4A + Q6A + Q7A + Q8A + Q9A + Q11A + 
+             Q12A + Q14A + Q15A + Q18A + Q19A + Q20A + Q22A + Q23A + Q25A +
+             Q27A + Q28A + Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A + 
+             Q40A + Q41A, trainData)) # Not significant: Q4A, Q7A, Q12A, Q19A, Q25A, Q41A
+# Less significant: Q23A
+# Rsq = 0.5916, adj rsq = 5912, F(28, 29802) = 1542, p < .001
+plot(lm(depression_trans_2 ~ Q1A + Q2A + Q4A + Q6A + Q7A + Q8A + Q9A + Q11A + 
+             Q12A + Q14A + Q15A + Q18A + Q19A + Q20A + Q22A + Q23A + Q25A +
+             Q27A + Q28A + Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A + 
+             Q40A + Q41A, trainData))
+# Little worse I think
+
+summary(lm(depression_trans_2 ~ Q4A, trainData)) # Sig, 0.641
+summary(lm(depression_trans_2 ~ Q7A, trainData)) # Sig, 0.656
+summary(lm(depression_trans_2 ~ Q23A, trainData)) # Sig, 0.707
+summary(lm(depression_trans_2 ~ Q19A, trainData)) # Sig, 0.506
+summary(lm(depression_trans_2 ~ Q25A, trainData)) # Sig, 0.589
+summary(lm(depression_trans_2 ~ Q41A, trainData)) # Sig, 0.610
+summary(lm(depression_trans_2 ~ Q12A, trainData)) # Sig, 0.762
+
+
+summary(lm(depression_trans_2 ~ Q8A + Q11A + Q22A + Q27A + Q36A, trainData)) # 5 biggest predictors
+# Rsq = 0.555, adj rsq = 0.555, F(5, 29825) = 7440, p < .001
+# Everything significant, Q11A and then Q36A are the biggest predictors
+plot(lm(depression_trans_2 ~ Q8A + Q11A + Q22A + Q27A + Q36A, trainData))
+# Diagnostics are about the same, maybe a little worse
+# This model explains 94% of the variance that the other one could explain (not necessarily the same variance but in terms of efficacy), with 5 instead of 28 predictors.
+```
+
+### Demographic Predictors
+
+```{r Linear Depression Dem}
+summary(lm(depression_score ~ education, trainData)) # Overall sig, rsq of like 0.03 tho
+summary(lm(depression_score ~ orientation, trainData)) # Overall sig, again rsq of like 0.016
+summary(lm(depression_score ~ race, trainData)) # Overall sig, rsq = 0.005
+summary(lm(depression_score ~ urban, trainData)) # Overall sig, rsq = 0.001
+summary(lm(depression_score ~ gender, trainData)) # Overall sig, rsq = 0.005
+summary(lm(depression_score ~ age, trainData)) # Overall sig, rsq = 0.002
+summary(lm(depression_score ~ voted, trainData)) # Overall sig, rsq = 0.009
+summary(lm(depression_score ~ married, trainData)) # Overall sig, rsq = 0.02
+summary(lm(depression_score ~ familysize, trainData)) # Overall sig, rsq = 0.002
+summary(lm(depression_score ~ country_simp, trainData)) # Overall sig, rsq = 0.008
+
+summary(lm(depression_score ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)) # Overall sig, rsq = 0.06
+# Only variables sig are education, orientation, race, gender, voting, marriage
+```
+
+```{r Linear Depression Trans Dem}
+summary(lm(depression_trans ~ education, trainData)) # Overall sig, rsq of like 0.03 tho
+summary(lm(depression_trans ~ orientation, trainData)) # Overall sig, again rsq of like 0.016
+summary(lm(depression_trans ~ race, trainData)) # Overall sig, rsq = 0.004
+summary(lm(depression_trans ~ urban, trainData)) # Overall sig, rsq = 0.0009
+summary(lm(depression_trans ~ gender, trainData)) # Overall sig, rsq = 0.005
+summary(lm(depression_trans ~ age, trainData)) # Overall sig, rsq = 0.002
+summary(lm(depression_trans ~ voted, trainData)) # Overall sig, rsq = 0.01
+summary(lm(depression_trans ~ married, trainData)) # Overall sig, rsq = 0.02
+summary(lm(depression_trans ~ familysize, trainData)) # Overall sig, rsq = 0.002
+summary(lm(depression_trans ~ country_simp, trainData)) # Overall sig, rsq = 0.007
+
+summary(lm(depression_trans ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)) # Overall sig, rsq = 0.06
+# Only variables sig are education, orientation, race, gender, voting, marriage, country
+```
+
+```{r Linear Depression Trans 2 Dem}
+summary(lm(depression_trans_2 ~ education, trainData)) # Overall sig, rsq of like 0.03 tho
+summary(lm(depression_trans_2 ~ orientation, trainData)) # Overall sig, again rsq of like 0.015
+summary(lm(depression_trans_2 ~ race, trainData)) # Overall sig, rsq = 0.004
+summary(lm(depression_trans_2 ~ urban, trainData)) # Overall sig, rsq = 0.0008
+summary(lm(depression_trans_2 ~ gender, trainData)) # Overall sig, rsq = 0.005
+summary(lm(depression_trans_2 ~ age, trainData)) # Overall sig, rsq = 0.003
+summary(lm(depression_trans_2 ~ voted, trainData)) # Overall sig, rsq = 0.01
+summary(lm(depression_trans_2 ~ married, trainData)) # Overall sig, rsq = 0.02
+summary(lm(depression_trans_2 ~ familysize, trainData)) # Overall sig, rsq = 0.002
+summary(lm(depression_trans_2 ~ country_simp, trainData)) # Overall sig, rsq = 0.006
+
+summary(lm(depression_trans_2 ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)) # Overall sig, rsq = 0.06
+# Only variables sig are education, orientation, race, gender, voting, marriage, country
+```
+
+### Personality
+
+```{r Linear Depression Personality}
+summary(lm(depression_score ~ extraversion, trainData)) # Sig, rsq = 0.09
+summary(lm(depression_score ~ agreeableness, trainData)) # Sig, rsq = 0.03
+summary(lm(depression_score ~ conscientiousness, trainData)) # Sig, rsq = 0.09
+summary(lm(depression_score ~ emotional_stability, trainData)) # Sig, rsq = 0.28
+summary(lm(depression_score ~ openness, trainData)) # Sig, rsq = 0.06
+
+summary(lm(depression_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData)) # Sig, rsq = 0.34
+plot(lm(depression_score ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData))
+# Little worse
+
+plot(lm(depression_score ~ emotional_stability, trainData))
+# Little worse
+```
+
+```{r Linear Depression Trans Personality}
+summary(lm(depression_trans ~ extraversion, trainData)) # Sig, rsq = 0.09
+summary(lm(depression_trans ~ agreeableness, trainData)) # Sig, rsq = 0.03
+summary(lm(depression_trans ~ conscientiousness, trainData)) # Sig, rsq = 0.09
+summary(lm(depression_trans ~ emotional_stability, trainData)) # Sig, rsq = 0.29
+summary(lm(depression_trans ~ openness, trainData)) # Sig, rsq = 0.06
+
+summary(lm(depression_trans ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData)) # Sig, rsq = 0.36
+plot(lm(depression_trans ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData))
+# Better, not good
+
+plot(lm(depression_trans ~ emotional_stability, trainData))
+# Little worse
+```
+
+```{r Linear Depression Trans 2 Personality}
+summary(lm(depression_trans_2 ~ extraversion, trainData)) # Sig, rsq = 0.09
+summary(lm(depression_trans_2 ~ agreeableness, trainData)) # Sig, rsq = 0.03
+summary(lm(depression_trans_2 ~ conscientiousness, trainData)) # Sig, rsq = 0.09
+summary(lm(depression_trans_2 ~ emotional_stability, trainData)) # Sig, rsq = 0.3
+summary(lm(depression_trans_2 ~ openness, trainData)) # Sig, rsq = 0.06
+
+summary(lm(depression_trans_2 ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData)) # Sig, rsq = 0.36
+plot(lm(depression_trans_2 ~ extraversion + agreeableness + conscientiousness + 
+             emotional_stability + openness, trainData))
+# Probably slightly worse, maybe the same
+
+plot(lm(depression_trans_2 ~ emotional_stability, trainData))
+# Worse
+```
+
+### Good Simple Model
+
+```{r Linear Depression Good Simple Model}
+summary(lm(depression_score ~ Q8A + Q11A + Q22A + Q27A + Q36A +
+             emotional_stability + extraversion, trainData)) # Rsq = 0.5914, adj rsq = 0.5913, F(7, 29226) = 6042, p < .001
+# Substantial improvement with two personality measures
+
+plot(lm(depression_score ~ Q8A + Q11A + Q22A + Q27A + Q36A +
+             emotional_stability + extraversion, trainData))
+# Slightly below average
+
+summary(lm(depression_trans ~  Q8A + Q11A + Q22A + Q27A + Q36A +
+             emotional_stability + extraversion, trainData)) # Rsq = 0.5966, adj rsq = 0.5965, F(7, 29226) = 6175, p < .001
+# Definitely better than untransformed
+
+plot(lm(depression_trans ~  Q8A + Q11A + Q22A + Q27A + Q36A +
+             emotional_stability + extraversion, trainData))
+# About the same
+
+summary(lm(depression_trans_2 ~  Q8A + Q11A + Q22A + Q27A + Q36A +
+             emotional_stability + extraversion, trainData)) # Rsq = 0.5869, adj rsq = 0.5868, F(7, 29226) = 5932, p < .001
+# Not better than untransformed
+plot(lm(depression_trans_2 ~  Q8A + Q11A + Q22A + Q27A + Q36A +
+             emotional_stability + extraversion, trainData))
+# Worse. It's worse.
+```
+
+### Do these improve beyond best predictors of its own scale?
+
+```{r Linear Depression Mixed}
+summary(lm(depression_score ~  Q8A + Q11A + Q22A + Q27A + Q36A + Q3A + Q13A +
+             emotional_stability + extraversion, trainData)) # Everything sig, rsq = 0.8282, adj rsq = 0.8282
+# We can probably throw in more from its own scale, but we want to keep these as small as possible
+
+plot(lm(depression_score ~  Q8A + Q11A + Q22A + Q27A + Q36A + Q3A + Q13A +
+             emotional_stability + extraversion, trainData)) # Pretty solid
+
+summary(lm(depression_trans ~  Q8A + Q11A + Q22A + Q27A + Q36A + Q3A + Q13A +
+             emotional_stability + extraversion, trainData)) # Everything sig, rsq = adj rsq = 0.8235
+
+plot(lm(depression_trans ~  Q8A + Q11A + Q22A + Q27A + Q36A + Q3A + Q13A +
+             emotional_stability + extraversion, trainData))
+# Notably better
+
+summary(lm(depression_trans_2 ~  Q8A + Q11A + Q22A + Q27A + Q36A + Q26A + Q13A +
+             emotional_stability + extraversion, trainData)) # Everything sig, rsq = 0.7819, adj rsq = 0.7818
+
+plot(lm(depression_trans_2 ~  Q8A + Q11A + Q22A + Q27A + Q36A + Q26A + Q13A +
+             emotional_stability + extraversion, trainData)) # Good deal worse
+```
+
+## Best Variables
+
+### Stress
+
+Not including its own scale: Q9A, Q13A, Q18A, Q30A, Q40A, emotional_stability
+
+Including own scale: Q1A, Q11A are highest
+
+### Anxiety
+
+Not including its own scale: Q33A, Q12A, Q14A, Q29A, maybe emotional stability?
+
+Including its own scale: 23A, 7A are highest for untransformed; 28A, 7A, 8A are highest for transformed
+
+### Depression
+
+Not including its own scale: Q8A, Q11A, Q22A, Q27A, Q26A
+
+Including its own scale: Q3A, Q13A, emotional stability, extraversion
+
+### Aggregate
+
+Emotional stability, Q13A, Q11A, Q8A
+
+# Shrinkage Models
+
+## Stress
+
+```{r Shrinkage Stress}
+str_score <- trainData$stress_score
+str_trans <- trainData$stress_trans
+```
+
+
+### Stress Scales
+
+```{r Shrinkage Stress Pred}
+stress_pred <- model.matrix(stress_score ~ Q1A + Q6A + Q8A + Q11A + Q12A +
+                              Q14A + Q18A + Q22A + Q27A + Q29A + Q32A + Q33A + 
+                              Q35A + Q39A, trainData)[,-1]
+stress_trans_pred <- model.matrix(stress_trans ~ Q1A + Q6A + Q8A + Q11A + Q12A +
+                              Q14A + Q18A + Q22A + Q27A + Q29A + Q32A + Q33A + 
+                              Q35A + Q39A, trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Stress}
+set.seed(1)
+stress_ridge_cv <- cv.glmnet(stress_pred, str_score, alpha = 0)
+stress_ridge_bestlam <- stress_ridge_cv$lambda.min
+stress_ridge_bestlam
+
+stress_ridge <- glmnet(stress_pred, str_score, alpha = 0,
+                       lambda = stress_ridge_bestlam)
+coef(stress_ridge)
+# Biggest: Q1A, Q11A, Q39A
+# Smallest: Q14A, Q18A
+```
+
+```{r Ridge Stress Trans}
+set.seed(1)
+stress_t_ridge_cv <- cv.glmnet(stress_trans_pred, str_trans, alpha = 0)
+stress_t_ridge_bestlam <- stress_t_ridge_cv$lambda.min
+stress_t_ridge_bestlam
+
+stress_t_ridge <- glmnet(stress_trans_pred, str_trans, alpha = 0,
+                       lambda = stress_t_ridge_bestlam)
+coef(stress_t_ridge)
+# Biggest: Q11A, Q29A
+# Smallest: Q22A, Q35A
+```
+
+#### Lasso
+
+```{r Lasso Stress}
+set.seed(1)
+stress_lasso_cv <- cv.glmnet(stress_pred, str_score, alpha = 1)
+stress_lasso_bestlam <- stress_lasso_cv$lambda.min
+stress_lasso_bestlam
+
+stress_lasso <- glmnet(stress_pred, str_score, alpha = 1,
+                       lambda = stress_lasso_bestlam)
+coef(stress_lasso)
+# Biggest: Q1A, Q11A, Q27A
+# Smallest: Q14A, Q18A
+```
+
+```{r Lasso Stress Trans}
+set.seed(1)
+stress_t_lasso_cv <- cv.glmnet(stress_trans_pred, str_trans, alpha = 1)
+stress_t_lasso_bestlam <- stress_t_lasso_cv$lambda.min
+stress_t_lasso_bestlam
+
+stress_t_lasso <- glmnet(stress_trans_pred, str_trans, alpha = 1,
+                       lambda = stress_t_lasso_bestlam)
+coef(stress_t_lasso)
+# Biggest: Q11A, Q27A, Q29A
+# Smallest: Q22A, Q35A
+```
+
+### Oher Scales
+
+```{r Shrinkage Stress Other}
+stress_pred_oth <- model.matrix(stress_score ~ Q2A + Q3A + Q4A + Q5A + Q7A +
+                                  Q9A + Q10A + Q13A + Q15A + Q16A + Q17A +
+                                  Q19A + Q20A + Q21A + Q23A + Q24A + Q25A + 
+                                  Q26A + Q28A + Q30A + Q31A + Q34A + Q36A + 
+                                  Q37A + Q38A + Q40A + Q41A + Q42A,
+                                trainData)[,-1]
+stress_t_pred_oth <- model.matrix(stress_trans ~ Q2A + Q3A + Q4A + Q5A + Q7A +
+                                  Q9A + Q10A + Q13A + Q15A + Q16A + Q17A +
+                                  Q19A + Q20A + Q21A + Q23A + Q24A + Q25A + 
+                                  Q26A + Q28A + Q30A + Q31A + Q34A + Q36A + 
+                                  Q37A + Q38A + Q40A + Q41A + Q42A,
+                                trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Stress Other}
+set.seed(1)
+stress_oth_ridge_cv <- cv.glmnet(stress_pred_oth, str_score, alpha = 0)
+stress_oth_ridge_bestlam <- stress_oth_ridge_cv$lambda.min
+stress_oth_ridge_bestlam
+
+stress_oth_ridge <- glmnet(stress_pred_oth, str_score, alpha = 0,
+                       lambda = stress_oth_ridge_bestlam)
+coef(stress_oth_ridge)
+# Biggest: Q9A, Q13A, Q28A, Q30A
+# Smallest: Q10A, Q16A, Q21A
+```
+
+```{r Ridge Stress Trans Other}
+set.seed(1)
+stress_t_oth_ridge_cv <- cv.glmnet(stress_t_pred_oth, str_trans, alpha = 0)
+stress_t_oth_ridge_bestlam <- stress_t_oth_ridge_cv$lambda.min
+stress_t_oth_ridge_bestlam
+
+stress_t_oth_ridge <- glmnet(stress_t_pred_oth, str_trans, alpha = 0,
+                       lambda = stress_t_oth_ridge_bestlam)
+coef(stress_t_oth_ridge)
+# Biggest: Q9A, Q13A, Q28A
+# Smallest: Q10A, Q16A, Q21A, Q34A, Q37A, Q38A, Q41A
+```
+
+#### Lasso
+
+```{r Lasso Stress Other}
+set.seed(1)
+stress_oth_lasso_cv <- cv.glmnet(stress_pred_oth, str_score, alpha = 1)
+stress_oth_lasso_bestlam <- stress_oth_lasso_cv$lambda.min
+stress_oth_lasso_bestlam
+
+stress_oth_lasso <- glmnet(stress_pred_oth, str_score, alpha = 1,
+                       lambda = stress_oth_lasso_bestlam)
+coef(stress_oth_lasso)
+# Biggest: Q9A, Q13A, Q28A, Q30A
+# Smallest: Q16A, Q21A, Q34A, Q38A
+```
+
+```{r Lasso Stress Trans Other}
+set.seed(1)
+stress_t_oth_lasso_cv <- cv.glmnet(stress_t_pred_oth, str_trans, alpha = 1)
+stress_t_oth_lasso_bestlam <- stress_t_oth_lasso_cv$lambda.min
+stress_t_oth_lasso_bestlam
+
+stress_t_oth_lasso <- glmnet(stress_t_pred_oth, str_trans, alpha = 1,
+                       lambda = stress_t_oth_lasso_bestlam)
+coef(stress_t_oth_lasso)
+# Biggest: Q9A, Q13A, Q28A
+# Smallest: Q10A, Q16A, Q21A, Q23A, Q31A, Q34A, Q37A, Q38A, Q41A
+```
+
+### Demographics
+
+```{r Shrinkage Stress Dem}
+stress_pred_dem <- model.matrix(stress_score ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)[,-1]
+stress_t_pred_dem <- model.matrix(stress_trans ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Stress Dem}
+set.seed(1)
+stress_dem_ridge_cv <- cv.glmnet(stress_pred_dem, str_score, alpha = 0)
+stress_dem_ridge_bestlam <- stress_dem_ridge_cv$lambda.min
+stress_dem_ridge_bestlam
+
+stress_dem_ridge <- glmnet(stress_pred_dem, str_score, alpha = 0,
+                       lambda = stress_dem_ridge_bestlam)
+coef(stress_dem_ridge)
+# Biggest: education, orientation, race, gender, marriage
+# Smallest: urban, age, family size
+```
+
+```{r Ridge Stress Trans Dem}
+set.seed(1)
+stress_t_dem_ridge_cv <- cv.glmnet(stress_t_pred_dem, str_trans, alpha = 0)
+stress_t_dem_ridge_bestlam <- stress_t_dem_ridge_cv$lambda.min
+stress_t_dem_ridge_bestlam
+
+stress_t_dem_ridge <- glmnet(stress_t_pred_dem, str_trans, alpha = 0,
+                       lambda = stress_t_dem_ridge_bestlam)
+coef(stress_t_dem_ridge)
+# Biggest: education, orientation, race, gender, marriage, country
+# Smallest: urban, age, family size
+```
+
+#### Lasso
+
+```{r Lasso Stress Dem}
+set.seed(1)
+stress_dem_lasso_cv <- cv.glmnet(stress_pred_dem, str_score, alpha = 1)
+stress_dem_lasso_bestlam <- stress_dem_lasso_cv$lambda.min
+stress_dem_lasso_bestlam
+
+stress_dem_lasso <- glmnet(stress_pred_dem, str_score, alpha = 1,
+                       lambda = stress_dem_lasso_bestlam)
+coef(stress_dem_lasso)
+# Biggest: education, orientation, race, gender, marriage
+# Smallest: urban, age, family size
+```
+
+```{r Lasso Stress Trans Dem}
+set.seed(1)
+stress_t_dem_lasso_cv <- cv.glmnet(stress_t_pred_dem, str_trans, alpha = 1)
+stress_t_dem_lasso_bestlam <- stress_t_dem_lasso_cv$lambda.min
+stress_t_dem_lasso_bestlam
+
+stress_t_dem_lasso <- glmnet(stress_t_pred_dem, str_trans, alpha = 1,
+                       lambda = stress_t_dem_lasso_bestlam)
+coef(stress_t_dem_lasso)
+# Biggest: education, orientation, race, gender, marriage
+# Smallest: urban, age, family size
+```
+
+### Personality
+
+```{r Shrinkage Stress Personality}
+stress_pred_pers <- model.matrix(stress_score ~ extraversion + agreeableness +
+                                   conscientiousness + emotional_stability +
+                                   openness, trainData)[,-1]
+stress_t_pred_pers <- model.matrix(stress_trans ~ extraversion + agreeableness +
+                                   conscientiousness + emotional_stability +
+                                   openness, trainData)[,-1]
+stress_pred_pers_2 <- model.matrix(stress_score ~ TIPI1 + TIPI2 + TIPI3 +
+                                     TIPI4 + TIPI5 + TIPI6 + TIPI7 + TIPI8 +
+                                     TIPI9 + TIPI10, trainData)
+stress_t_pred_pers_2 <- model.matrix(stress_trans ~ TIPI1 + TIPI2 + TIPI3 +
+                                       TIPI4 + TIPI5 + TIPI6 + TIPI7 + TIPI8 +
+                                       TIPI9 + TIPI10, trainData)
+str_score_2 <- trainData$stress_score[!is.na(trainData$extraversion) &
+                                      !is.na(trainData$agreeableness) &
+                                      !is.na(trainData$conscientiousness) &
+                                      !is.na(trainData$emotional_stability) &
+                                      !is.na(trainData$openness)]
+str_trans_2 <- trainData$stress_trans[!is.na(trainData$extraversion) &
+                                      !is.na(trainData$agreeableness) &
+                                      !is.na(trainData$conscientiousness) &
+                                      !is.na(trainData$emotional_stability) &
+                                      !is.na(trainData$openness)]
+```
+
+#### Ridge
+
+```{r Ridge Stress Pers}
+set.seed(1)
+stress_pers_ridge_cv <- cv.glmnet(stress_pred_pers, str_score_2, alpha = 0)
+stress_pers_ridge_bestlam <- stress_pers_ridge_cv$lambda.min
+stress_pers_ridge_bestlam
+
+stress_pers_ridge <- glmnet(stress_pred_pers, str_score_2, alpha = 0,
+                       lambda = stress_pers_ridge_bestlam)
+coef(stress_pers_ridge)
+# Biggest: emotional stability (by far)
+# Smallest: openness
+
+set.seed(1)
+stress_pers_2_ridge_cv <- cv.glmnet(stress_pred_pers_2, str_score, alpha = 0)
+stress_pers_2_ridge_bestlam <- stress_pers_2_ridge_cv$lambda.min
+stress_pers_2_ridge_bestlam
+
+stress_pers_2_ridge <- glmnet(stress_pred_pers_2, str_score, alpha = 0,
+                       lambda = stress_pers_2_ridge_bestlam)
+coef(stress_pers_2_ridge)
+# Biggest: TIPI4 (emotional stability), TIPI9 (smaller, same)
+# Smallest: TIPI3, TIPI7, TIPI10
+```
+
+```{r Ridge Stress Trans Pers}
+set.seed(1)
+stress_t_pers_ridge_cv <- cv.glmnet(stress_t_pred_pers, str_trans_2, alpha = 0)
+stress_t_pers_ridge_bestlam <- stress_t_pers_ridge_cv$lambda.min
+stress_t_pers_ridge_bestlam
+
+stress_t_pers_ridge <- glmnet(stress_t_pred_pers, str_trans_2, alpha = 0,
+                       lambda = stress_t_pers_ridge_bestlam)
+coef(stress_t_pers_ridge)
+# Biggest: emotional stability
+# Smallest: openness
+
+set.seed(1)
+stress_t_pers_2_ridge_cv <- cv.glmnet(stress_t_pred_pers_2, str_trans, alpha = 0)
+stress_t_pers_2_ridge_bestlam <- stress_t_pers_2_ridge_cv$lambda.min
+stress_t_pers_2_ridge_bestlam
+
+stress_t_pers_2_ridge <- glmnet(stress_t_pred_pers_2, str_trans, alpha = 0,
+                       lambda = stress_t_pers_2_ridge_bestlam)
+coef(stress_t_pers_2_ridge)
+# Biggest: TIPI4, TIPI9
+# Smallest: TIPI3, TIPI6, TIPI7, TIPI10
+```
+
+#### Lasso
+
+```{r Lasso Stress Pers}
+set.seed(1)
+stress_pers_lasso_cv <- cv.glmnet(stress_pred_pers, str_score_2, alpha = 1)
+stress_pers_lasso_bestlam <- stress_pers_lasso_cv$lambda.min
+stress_pers_lasso_bestlam
+
+stress_pers_lasso <- glmnet(stress_pred_pers, str_score_2, alpha = 1,
+                       lambda = stress_pers_lasso_bestlam)
+coef(stress_pers_lasso)
+# Biggest: emotional stability
+# Smallest: conscientiousness
+
+set.seed(1)
+stress_pers_2_lasso_cv <- cv.glmnet(stress_pred_pers_2, str_score, alpha = 1)
+stress_pers_2_lasso_bestlam <- stress_pers_2_lasso_cv$lambda.min
+stress_pers_2_lasso_bestlam
+
+stress_pers_2_lasso <- glmnet(stress_pred_pers_2, str_score, alpha = 1,
+                       lambda = stress_pers_2_lasso_bestlam)
+coef(stress_pers_2_lasso)
+# Biggest: TIPI4, TIPI9 (TIPI2 also showing promise, from agreeableness)
+# Smallest: TIPI3, TIPI7, TIPI10
+```
+
+```{r Lasso Stress Trans Pers}
+set.seed(1)
+stress_t_pers_lasso_cv <- cv.glmnet(stress_t_pred_pers, str_trans_2, alpha = 1)
+stress_t_pers_lasso_bestlam <- stress_t_pers_lasso_cv$lambda.min
+stress_t_pers_lasso_bestlam
+
+stress_t_pers_lasso <- glmnet(stress_t_pred_pers, str_trans_2, alpha = 1,
+                       lambda = stress_t_pers_lasso_bestlam)
+coef(stress_t_pers_lasso)
+# Biggest: emotional stability
+# Smallest: conscientiousness
+
+set.seed(1)
+stress_t_pers_2_lasso_cv <- cv.glmnet(stress_t_pred_pers_2, str_trans, alpha = 1)
+stress_t_pers_2_lasso_bestlam <- stress_t_pers_2_lasso_cv$lambda.min
+stress_t_pers_2_lasso_bestlam
+
+stress_t_pers_2_lasso <- glmnet(stress_t_pred_pers_2, str_trans, alpha = 1,
+                       lambda = stress_t_pers_2_lasso_bestlam)
+coef(stress_t_pers_2_lasso)
+# Biggest: TIPI4, TIPI9
+# Smallest: TIPI1, TIPI3, TIPI6, TIPI7, TIPI10
+```
+
+## Anxiety
+
+```{r Shrinkage Anxiety}
+anx_score <- trainData$anxiety_score
+anx_trans <- trainData$anxiety_trans
+```
+
+### Anxiety Scales
+
+```{r Shrinkage Anxiety Pred}
+anx_pred <- model.matrix(anxiety_score ~ Q2A + Q4A + Q7A + Q9A + Q15A +
+                              Q19A + Q20A + Q23A + Q25A + Q28A + Q30A + Q36A + 
+                              Q40A + Q41A, trainData)[,-1]
+anx_t_pred <- model.matrix(anxiety_trans ~ Q2A + Q4A + Q7A + Q9A + Q15A +
+                              Q19A + Q20A + Q23A + Q25A + Q28A + Q30A + Q36A + 
+                              Q40A + Q41A, trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Anxiety}
+set.seed(1)
+anx_ridge_cv <- cv.glmnet(anx_pred, anx_score, alpha = 0)
+anx_ridge_bestlam <- anx_ridge_cv$lambda.min
+anx_ridge_bestlam
+
+anx_ridge <- glmnet(anx_pred, anx_score, alpha = 0,
+                       lambda = anx_ridge_bestlam)
+coef(anx_ridge)
+# Biggest: Q7A, Q23A
+# Smallest: Q2A, Q19A
+```
+
+```{r Ridge Anxiety Trans}
+set.seed(1)
+anx_t_ridge_cv <- cv.glmnet(anx_t_pred, anx_trans, alpha = 0)
+anx_t_ridge_bestlam <- anx_t_ridge_cv$lambda.min
+anx_t_ridge_bestlam
+
+anx_t_ridge <- glmnet(anx_t_pred, anx_trans, alpha = 0,
+                       lambda = anx_t_ridge_bestlam)
+coef(anx_t_ridge)
+# Biggest: Q9A, Q40A
+# Smallest: Q7A, Q15A, Q23A
+```
+
+#### Lasso
+
+```{r Lasso Anxiety}
+set.seed(1)
+anx_lasso_cv <- cv.glmnet(anx_pred, anx_score, alpha = 1)
+anx_lasso_bestlam <- anx_lasso_cv$lambda.min
+anx_lasso_bestlam
+
+anx_lasso <- glmnet(anx_pred, anx_score, alpha = 1,
+                       lambda = anx_lasso_bestlam)
+coef(anx_lasso)
+# Biggest: Q4A, Q7A, Q28A
+# Smallest: Q2A, Q19A, Q23A
+```
+
+```{r Lasso Anxiety Trans}
+set.seed(1)
+anx_t_lasso_cv <- cv.glmnet(anx_t_pred, anx_trans, alpha = 1)
+anx_t_lasso_bestlam <- anx_t_lasso_cv$lambda.min
+anx_t_lasso_bestlam
+
+anx_t_lasso <- glmnet(anx_t_pred, anx_trans, alpha = 1,
+                       lambda = anx_t_lasso_bestlam)
+coef(anx_t_lasso)
+# Biggest: Q2A, Q9A, Q40A
+# Smallest: Q7A, Q15A, Q23A
+```
+
+### Oher Scales
+
+```{r Shrinkage Anxiety Other}
+anx_pred_oth <- model.matrix(anxiety_score ~ Q1A + Q3A + Q5A + Q6A + Q8A +
+                               Q10A + Q11A + Q12A + Q13A + Q14A + Q16A + Q17A +
+                               Q18A + Q21A + Q22A + Q24A + Q26A + Q27A + Q29A +
+                               Q31A + Q32A + Q33A + Q34A + Q35A + Q37A + Q38A +
+                               Q39A + Q42A, trainData)[,-1]
+anx_t_pred_oth <- model.matrix(anxiety_trans ~ Q1A + Q3A + Q5A + Q6A + Q8A +
+                               Q10A + Q11A + Q12A + Q13A + Q14A + Q16A + Q17A +
+                               Q18A + Q21A + Q22A + Q24A + Q26A + Q27A + Q29A +
+                               Q31A + Q32A + Q33A + Q34A + Q35A + Q37A + Q38A +
+                               Q39A + Q42A, trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Anxiety Other}
+set.seed(1)
+anx_oth_ridge_cv <- cv.glmnet(anx_pred_oth, anx_score, alpha = 0)
+anx_oth_ridge_bestlam <- anx_oth_ridge_cv$lambda.min
+anx_oth_ridge_bestlam
+
+anx_oth_ridge <- glmnet(anx_pred_oth, anx_score, alpha = 0,
+                       lambda = anx_oth_ridge_bestlam)
+coef(anx_oth_ridge)
+# Biggest: Q12A, Q33A
+# Smallest: Q3A, Q5A, Q10A, Q11A, Q13A, Q24A, Q27A, Q31A, Q42A
+```
+
+```{r Ridge Anx Trans Other}
+set.seed(1)
+anx_t_oth_ridge_cv <- cv.glmnet(anx_t_pred_oth, anx_trans, alpha = 0)
+anx_t_oth_ridge_bestlam <- anx_t_oth_ridge_cv$lambda.min
+anx_t_oth_ridge_bestlam
+
+anx_t_oth_ridge <- glmnet(anx_t_pred_oth, anx_trans, alpha = 0,
+                       lambda = anx_t_oth_ridge_bestlam)
+coef(anx_t_oth_ridge)
+# Biggest: Q12A, Q33A
+# Smallest: Q5A, Q24A, Q27A, Q31A, Q38A
+```
+
+#### Lasso
+
+```{r Lasso Anxiety Other}
+set.seed(1)
+anx_oth_lasso_cv <- cv.glmnet(anx_pred_oth, anx_score, alpha = 1)
+anx_oth_lasso_bestlam <- anx_oth_lasso_cv$lambda.min
+anx_oth_lasso_bestlam
+
+anx_oth_lasso <- glmnet(anx_pred_oth, anx_score, alpha = 1,
+                       lambda = anx_oth_lasso_bestlam)
+coef(anx_oth_lasso)
+# Biggest: Q12A, Q33A
+# Smallest: Q3A, Q10A, Q13A, Q24A, Q27A, Q42A
+```
+
+```{r Lasso Anxiety Trans Other}
+set.seed(1)
+anx_t_oth_lasso_cv <- cv.glmnet(anx_t_pred_oth, anx_trans, alpha = 1)
+anx_t_oth_lasso_bestlam <- anx_t_oth_lasso_cv$lambda.min
+anx_t_oth_lasso_bestlam
+
+anx_t_oth_lasso <- glmnet(anx_t_pred_oth, anx_trans, alpha = 1,
+                       lambda = anx_t_oth_lasso_bestlam)
+coef(anx_t_oth_lasso)
+# Biggest: Q12A, Q33A
+# Smallest: Q5A, Q10A, Q24A, Q27A, Q38A
+```
+
+### Demographics
+
+```{r Shrinkage Anxiety Dem}
+anx_pred_dem <- model.matrix(anxiety_score ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)[,-1]
+anx_t_pred_dem <- model.matrix(anxiety_trans ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Anxiety Dem}
+set.seed(1)
+anx_dem_ridge_cv <- cv.glmnet(anx_pred_dem, anx_score, alpha = 0)
+anx_dem_ridge_bestlam <- anx_dem_ridge_cv$lambda.min
+anx_dem_ridge_bestlam
+
+anx_dem_ridge <- glmnet(anx_pred_dem, anx_score, alpha = 0,
+                       lambda = anx_dem_ridge_bestlam)
+coef(anx_dem_ridge)
+# Biggest: education, orientation, race, gender, voting, marriage, country
+# Smallest: urban, age, family size
+```
+
+```{r Ridge Anxiety Trans Dem}
+set.seed(1)
+anx_t_dem_ridge_cv <- cv.glmnet(anx_t_pred_dem, anx_trans, alpha = 0)
+anx_t_dem_ridge_bestlam <- anx_t_dem_ridge_cv$lambda.min
+anx_t_dem_ridge_bestlam
+
+anx_t_dem_ridge <- glmnet(anx_t_pred_dem, anx_trans, alpha = 0,
+                       lambda = anx_t_dem_ridge_bestlam)
+coef(anx_t_dem_ridge)
+# Biggest: education, orientation, race, gender, marriage, country
+# Smallest: urban, age, family size
+```
+
+#### Lasso
+
+```{r Lasso Anxiety Dem}
+set.seed(1)
+anx_dem_lasso_cv <- cv.glmnet(anx_pred_dem, anx_score, alpha = 1)
+anx_dem_lasso_bestlam <- anx_dem_lasso_cv$lambda.min
+anx_dem_lasso_bestlam
+
+anx_dem_lasso <- glmnet(anx_pred_dem, anx_score, alpha = 1,
+                       lambda = anx_dem_lasso_bestlam)
+coef(anx_dem_lasso)
+# Biggest: education, orientation, race, gender, marriage, country
+# Smallest: urban, age, family size
+```
+
+```{r Lasso Anxiety Trans Dem}
+set.seed(1)
+anx_t_dem_lasso_cv <- cv.glmnet(anx_t_pred_dem, anx_trans, alpha = 1)
+anx_t_dem_lasso_bestlam <- anx_t_dem_lasso_cv$lambda.min
+anx_t_dem_lasso_bestlam
+
+anx_t_dem_lasso <- glmnet(anx_t_pred_dem, anx_trans, alpha = 1,
+                       lambda = anx_t_dem_lasso_bestlam)
+coef(anx_t_dem_lasso)
+# Biggest: education, orientation, race, gender, marriage
+# Smallest: urban, age, family size
+```
+
+### Personality
+
+```{r Shrinkage Anxiety Personality}
+anx_pred_pers <- model.matrix(anx_score ~ extraversion + agreeableness +
+                                   conscientiousness + emotional_stability +
+                                   openness, trainData)[,-1]
+anx_t_pred_pers <- model.matrix(anx_trans ~ extraversion + agreeableness +
+                                   conscientiousness + emotional_stability +
+                                   openness, trainData)[,-1]
+anx_pred_pers_2 <- model.matrix(anx_score ~ TIPI1 + TIPI2 + TIPI3 +
+                                     TIPI4 + TIPI5 + TIPI6 + TIPI7 + TIPI8 +
+                                     TIPI9 + TIPI10, trainData)
+anx_t_pred_pers_2 <- model.matrix(anx_trans ~ TIPI1 + TIPI2 + TIPI3 +
+                                       TIPI4 + TIPI5 + TIPI6 + TIPI7 + TIPI8 +
+                                       TIPI9 + TIPI10, trainData)
+anx_score_2 <- trainData$anxiety_score[!is.na(trainData$extraversion) &
+                                      !is.na(trainData$agreeableness) &
+                                      !is.na(trainData$conscientiousness) &
+                                      !is.na(trainData$emotional_stability) &
+                                      !is.na(trainData$openness)]
+anx_trans_2 <- trainData$anxiety_trans[!is.na(trainData$extraversion) &
+                                      !is.na(trainData$agreeableness) &
+                                      !is.na(trainData$conscientiousness) &
+                                      !is.na(trainData$emotional_stability) &
+                                      !is.na(trainData$openness)]
+```
+
+#### Ridge
+
+```{r Ridge Anxiety Pers}
+set.seed(1)
+anx_pers_ridge_cv <- cv.glmnet(anx_pred_pers, anx_score_2, alpha = 0)
+anx_pers_ridge_bestlam <- anx_pers_ridge_cv$lambda.min
+anx_pers_ridge_bestlam
+
+anx_pers_ridge <- glmnet(anx_pred_pers, anx_score_2, alpha = 0,
+                       lambda = anx_pers_ridge_bestlam)
+coef(anx_pers_ridge)
+# Biggest: emotional stability (by far)
+# Smallest: agreeableness
+
+set.seed(1)
+anx_pers_2_ridge_cv <- cv.glmnet(anx_pred_pers_2, anx_score, alpha = 0)
+anx_pers_2_ridge_bestlam <- anx_pers_2_ridge_cv$lambda.min
+anx_pers_2_ridge_bestlam
+
+anx_pers_2_ridge <- glmnet(anx_pred_pers_2, anx_score, alpha = 0,
+                       lambda = anx_pers_2_ridge_bestlam)
+coef(anx_pers_2_ridge)
+# Biggest: TIPI4, TIPI9, maybe TIPI5
+# Smallest: TIPI1, TIPI2, TIPI7, TIPI10
+```
+
+```{r Ridge Anxiety Trans Pers}
+set.seed(1)
+anx_t_pers_ridge_cv <- cv.glmnet(anx_t_pred_pers, anx_trans_2, alpha = 0)
+anx_t_pers_ridge_bestlam <- anx_t_pers_ridge_cv$lambda.min
+anx_t_pers_ridge_bestlam
+
+anx_t_pers_ridge <- glmnet(anx_t_pred_pers, anx_trans_2, alpha = 0,
+                       lambda = anx_t_pers_ridge_bestlam)
+coef(anx_t_pers_ridge)
+# Biggest: emotional stability
+# Smallest: agreeableness
+
+set.seed(1)
+anx_t_pers_2_ridge_cv <- cv.glmnet(anx_t_pred_pers_2, anx_trans, alpha = 0)
+anx_t_pers_2_ridge_bestlam <- anx_t_pers_2_ridge_cv$lambda.min
+anx_t_pers_2_ridge_bestlam
+
+anx_t_pers_2_ridge <- glmnet(anx_t_pred_pers_2, anx_trans, alpha = 0,
+                       lambda = anx_t_pers_2_ridge_bestlam)
+coef(anx_t_pers_2_ridge)
+# Biggest: TIPI4, TIPI9
+# Smallest: TIPI1, TIPI2, TIPI3, TIPI7, TIPI10
+```
+
+#### Lasso
+
+```{r Lasso Anxiety Pers}
+set.seed(1)
+anx_pers_lasso_cv <- cv.glmnet(anx_pred_pers, anx_score_2, alpha = 1)
+anx_pers_lasso_bestlam <- anx_pers_lasso_cv$lambda.min
+anx_pers_lasso_bestlam
+
+anx_pers_lasso <- glmnet(anx_pred_pers, anx_score_2, alpha = 1,
+                       lambda = anx_pers_lasso_bestlam)
+coef(anx_pers_lasso)
+# Biggest: emotional stability
+# Smallest: agreeableness
+
+set.seed(1)
+anx_pers_2_lasso_cv <- cv.glmnet(anx_pred_pers_2, anx_score, alpha = 1)
+anx_pers_2_lasso_bestlam <- anx_pers_2_lasso_cv$lambda.min
+anx_pers_2_lasso_bestlam
+
+anx_pers_2_lasso <- glmnet(anx_pred_pers_2, anx_score, alpha = 1,
+                       lambda = anx_pers_2_lasso_bestlam)
+coef(anx_pers_2_lasso)
+# Biggest: TIPI4, TIPI9
+# Smallest: TIPI1, TIPI2, TIPI10
+```
+
+```{r Lasso Anxiety Trans Pers}
+set.seed(1)
+anx_t_pers_lasso_cv <- cv.glmnet(anx_t_pred_pers, anx_trans_2, alpha = 1)
+anx_t_pers_lasso_bestlam <- anx_t_pers_lasso_cv$lambda.min
+anx_t_pers_lasso_bestlam
+
+anx_t_pers_lasso <- glmnet(anx_t_pred_pers, anx_trans_2, alpha = 1,
+                       lambda = anx_t_pers_lasso_bestlam)
+coef(anx_t_pers_lasso)
+# Biggest: emotional stability
+# Smallest: agreeableness
+
+set.seed(1)
+anx_t_pers_2_lasso_cv <- cv.glmnet(anx_t_pred_pers_2, anx_trans, alpha = 1)
+anx_t_pers_2_lasso_bestlam <- anx_t_pers_2_lasso_cv$lambda.min
+anx_t_pers_2_lasso_bestlam
+
+anx_t_pers_2_lasso <- glmnet(anx_t_pred_pers_2, anx_trans, alpha = 1,
+                       lambda = anx_t_pers_2_lasso_bestlam)
+coef(anx_t_pers_2_lasso)
+# Biggest: TIPI4, TIPI9
+# Smallest: TIPI1, TIPI2, TIPI3, TIPI7, TIPI10
+```
+
+## Depression
+
+```{r Shrinkage Depression}
+dep_score <- trainData$depression_score
+dep_trans <- trainData$depression_trans
+```
+
+### Depression Scales
+
+```{r Shrinkage Depression Pred}
+dep_pred <- model.matrix(depression_score ~ Q3A + Q5A + Q10A + Q13A + Q16A +
+                              Q17A + Q21A + Q24A + Q26A + Q31A + Q34A + Q37A + 
+                              Q38A + Q42A, trainData)[,-1]
+dep_t_pred <- model.matrix(depression_trans ~ Q3A + Q5A + Q10A + Q13A + Q16A +
+                              Q17A + Q21A + Q24A + Q26A + Q31A + Q34A + Q37A + 
+                              Q38A + Q42A, trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Depression}
+set.seed(1)
+dep_ridge_cv <- cv.glmnet(dep_pred, dep_score, alpha = 0)
+dep_ridge_bestlam <- dep_ridge_cv$lambda.min
+dep_ridge_bestlam
+
+dep_ridge <- glmnet(dep_pred, dep_score, alpha = 0,
+                       lambda = dep_ridge_bestlam)
+coef(dep_ridge)
+# Biggest: Q3A, Q13A
+# Smallest: Q42A
+```
+
+```{r Ridge Depression Trans}
+set.seed(1)
+dep_t_ridge_cv <- cv.glmnet(dep_t_pred, dep_trans, alpha = 0)
+dep_t_ridge_bestlam <- dep_t_ridge_cv$lambda.min
+dep_t_ridge_bestlam
+
+dep_t_ridge <- glmnet(dep_t_pred, dep_trans, alpha = 0,
+                       lambda = dep_t_ridge_bestlam)
+coef(dep_t_ridge)
+# Biggest: Q13A, Q17A
+# Smallest: Q3A, Q21A, Q38A
+```
+
+#### Lasso
+
+```{r Lasso Depression}
+set.seed(1)
+dep_lasso_cv <- cv.glmnet(dep_pred, dep_score, alpha = 1)
+dep_lasso_bestlam <- dep_lasso_cv$lambda.min
+dep_lasso_bestlam
+
+dep_lasso <- glmnet(dep_pred, dep_score, alpha = 1,
+                       lambda = dep_lasso_bestlam)
+coef(dep_lasso)
+# Biggest: Q10A, Q13A, Q21A
+# Smallest: Q17A, Q24A, Q26A, Q31A, Q37A, Q42A
+```
+
+```{r Lasso Depression Trans}
+set.seed(1)
+dep_t_lasso_cv <- cv.glmnet(dep_t_pred, dep_trans, alpha = 1)
+dep_t_lasso_bestlam <- dep_t_lasso_cv$lambda.min
+dep_t_lasso_bestlam
+
+dep_t_lasso <- glmnet(dep_t_pred, dep_trans, alpha = 1,
+                       lambda = dep_t_lasso_bestlam)
+coef(dep_t_lasso)
+# Biggest: Q13A, Q17A
+# Smallest: Q3A, Q21A, Q37A, Q38A
+```
+
+### Oher Scales
+
+```{r Shrinkage Depression Other}
+dep_pred_oth <- model.matrix(depression_score ~ Q1A + Q2A + Q4A + Q6A + Q7A +
+                               Q8A + Q9A + Q11A + Q12A + Q14A + Q15A + Q18A +
+                               Q19A + Q20A + Q22A + Q23A + Q25A + Q27A + Q28A +
+                               Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A + 
+                               Q40A + Q41A, trainData)[,-1]
+dep_t_pred_oth <- model.matrix(depression_trans ~ Q1A + Q2A + Q4A + Q6A + Q7A +
+                               Q8A + Q9A + Q11A + Q12A + Q14A + Q15A + Q18A +
+                               Q19A + Q20A + Q22A + Q23A + Q25A + Q27A + Q28A +
+                               Q29A + Q30A + Q32A + Q33A + Q35A + Q36A + Q39A + 
+                               Q40A + Q41A, trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Depression Other}
+set.seed(1)
+dep_oth_ridge_cv <- cv.glmnet(dep_pred_oth, dep_score, alpha = 0)
+dep_oth_ridge_bestlam <- dep_oth_ridge_cv$lambda.min
+dep_oth_ridge_bestlam
+
+dep_oth_ridge <- glmnet(dep_pred_oth, dep_score, alpha = 0,
+                       lambda = dep_oth_ridge_bestlam)
+coef(dep_oth_ridge)
+# Biggest: Q8A, Q11A, Q22A, Q27A, Q36A
+# Smallest: Q4A, Q7A, Q9A, Q12A, Q19A, Q25A, Q41A
+```
+
+```{r Ridge Depression Trans Other}
+set.seed(1)
+dep_t_oth_ridge_cv <- cv.glmnet(dep_t_pred_oth, dep_trans, alpha = 0)
+dep_t_oth_ridge_bestlam <- dep_t_oth_ridge_cv$lambda.min
+dep_t_oth_ridge_bestlam
+
+dep_t_oth_ridge <- glmnet(dep_t_pred_oth, dep_trans, alpha = 0,
+                       lambda = dep_t_oth_ridge_bestlam)
+coef(dep_t_oth_ridge)
+# Biggest: Q8A, Q11A, Q27A
+# Smallest: Q4A, Q7A, Q9A, Q19A, Q25A, Q28A, Q41A
+```
+
+#### Lasso
+
+```{r Lasso Depression Other}
+set.seed(1)
+dep_oth_lasso_cv <- cv.glmnet(dep_pred_oth, dep_score, alpha = 1)
+dep_oth_lasso_bestlam <- dep_oth_lasso_cv$lambda.min
+dep_oth_lasso_bestlam
+
+dep_oth_lasso <- glmnet(dep_pred_oth, dep_score, alpha = 1,
+                       lambda = dep_oth_lasso_bestlam)
+coef(dep_oth_lasso)
+# Biggest: Q8A, Q11A, Q22A, Q27A, Q36A
+# Smallest: Q4A, Q7A, Q9A, Q19A, Q25A, Q41A
+```
+
+```{r Lasso Depression Trans Other}
+set.seed(1)
+dep_t_oth_lasso_cv <- cv.glmnet(dep_t_pred_oth, dep_trans, alpha = 1)
+dep_t_oth_lasso_bestlam <- dep_t_oth_lasso_cv$lambda.min
+dep_t_oth_lasso_bestlam
+
+dep_t_oth_lasso <- glmnet(dep_t_pred_oth, dep_trans, alpha = 1,
+                       lambda = dep_t_oth_lasso_bestlam)
+coef(dep_t_oth_lasso)
+# Biggest: Q8A, Q11A
+# Smallest: Q2A, Q7A, Q9A, Q19A, Q25A, Q33A, Q41A
+```
+
+### Demographics
+
+```{r Shrinkage Depression Dem}
+dep_pred_dem <- model.matrix(depression_score ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)[,-1]
+dep_t_pred_dem <- model.matrix(depression_trans ~ education + orientation + race +
+             urban + gender + age + voted + married + 
+             familysize + country_simp, trainData)[,-1]
+```
+
+#### Ridge
+
+```{r Ridge Depression Dem}
+set.seed(1)
+dep_dem_ridge_cv <- cv.glmnet(dep_pred_dem, dep_score, alpha = 0)
+dep_dem_ridge_bestlam <- dep_dem_ridge_cv$lambda.min
+dep_dem_ridge_bestlam
+
+dep_dem_ridge <- glmnet(dep_pred_dem, dep_score, alpha = 0,
+                       lambda = dep_dem_ridge_bestlam)
+coef(dep_dem_ridge)
+# Biggest: education, orientation, race, gender, marriage, country
+# Smallest: urban, age, family size
+```
+
+```{r Ridge Depression Trans Dem}
+set.seed(1)
+dep_t_dem_ridge_cv <- cv.glmnet(dep_t_pred_dem, dep_trans, alpha = 0)
+dep_t_dem_ridge_bestlam <- dep_t_dem_ridge_cv$lambda.min
+dep_t_dem_ridge_bestlam
+
+dep_t_dem_ridge <- glmnet(dep_t_pred_dem, dep_trans, alpha = 0,
+                       lambda = dep_t_dem_ridge_bestlam)
+coef(dep_t_dem_ridge)
+# Biggest: education, orientation, gender, marriage, country
+# Smallest: urban, age, family size
+```
+
+#### Lasso
+
+```{r Lasso Depression Dem}
+set.seed(1)
+dep_dem_lasso_cv <- cv.glmnet(dep_pred_dem, dep_score, alpha = 1)
+dep_dem_lasso_bestlam <- dep_dem_lasso_cv$lambda.min
+dep_dem_lasso_bestlam
+
+dep_dem_lasso <- glmnet(dep_pred_dem, dep_score, alpha = 1,
+                       lambda = dep_dem_lasso_bestlam)
+coef(dep_dem_lasso)
+# Biggest: education, orientation, race, gender, marriage, country
+# Smallest: urban, age, family size
+```
+
+```{r Lasso Depression Trans Dem}
+set.seed(1)
+dep_t_dem_lasso_cv <- cv.glmnet(dep_t_pred_dem, dep_trans, alpha = 1)
+dep_t_dem_lasso_bestlam <- dep_t_dem_lasso_cv$lambda.min
+dep_t_dem_lasso_bestlam
+
+dep_t_dem_lasso <- glmnet(dep_t_pred_dem, dep_trans, alpha = 1,
+                       lambda = dep_t_dem_lasso_bestlam)
+coef(dep_t_dem_lasso)
+# Biggest: education, orientation, gender, marriage
+# Smallest: urban, age, family size
+```
+
+### Personality
+
+```{r Shrinkage Depression Personality}
+dep_pred_pers <- model.matrix(depression_score ~ extraversion + agreeableness +
+                                   conscientiousness + emotional_stability +
+                                   openness, trainData)[,-1]
+dep_t_pred_pers <- model.matrix(depression_trans ~ extraversion + agreeableness +
+                                   conscientiousness + emotional_stability +
+                                   openness, trainData)[,-1]
+dep_pred_pers_2 <- model.matrix(depression_score ~ TIPI1 + TIPI2 + TIPI3 +
+                                     TIPI4 + TIPI5 + TIPI6 + TIPI7 + TIPI8 +
+                                     TIPI9 + TIPI10, trainData)
+dep_t_pred_pers_2 <- model.matrix(depression_trans ~ TIPI1 + TIPI2 + TIPI3 +
+                                       TIPI4 + TIPI5 + TIPI6 + TIPI7 + TIPI8 +
+                                       TIPI9 + TIPI10, trainData)
+dep_score_2 <- trainData$depression_score[!is.na(trainData$extraversion) &
+                                      !is.na(trainData$agreeableness) &
+                                      !is.na(trainData$conscientiousness) &
+                                      !is.na(trainData$emotional_stability) &
+                                      !is.na(trainData$openness)]
+dep_trans_2 <- trainData$depression_trans[!is.na(trainData$extraversion) &
+                                      !is.na(trainData$agreeableness) &
+                                      !is.na(trainData$conscientiousness) &
+                                      !is.na(trainData$emotional_stability) &
+                                      !is.na(trainData$openness)]
+```
+
+#### Ridge
+
+```{r Ridge Depression Pers}
+set.seed(1)
+dep_pers_ridge_cv <- cv.glmnet(dep_pred_pers, dep_score_2, alpha = 0)
+dep_pers_ridge_bestlam <- dep_pers_ridge_cv$lambda.min
+dep_pers_ridge_bestlam
+
+dep_pers_ridge <- glmnet(dep_pred_pers, dep_score_2, alpha = 0,
+                       lambda = dep_pers_ridge_bestlam)
+coef(dep_pers_ridge)
+# Biggest: emotional stability, extraversion
+# Smallest: agreeableness
+
+set.seed(1)
+dep_pers_2_ridge_cv <- cv.glmnet(dep_pred_pers_2, dep_score, alpha = 0)
+dep_pers_2_ridge_bestlam <- dep_pers_2_ridge_cv$lambda.min
+dep_pers_2_ridge_bestlam
+
+dep_pers_2_ridge <- glmnet(dep_pred_pers_2, dep_score, alpha = 0,
+                       lambda = dep_pers_2_ridge_bestlam)
+coef(dep_pers_2_ridge)
+# Biggest: TIPI4, TIPI9, maybe TIPI6 and TIPI1
+# Smallest: TIPI2, TIPI5, TIPI7, TIPI10
+```
+
+```{r Ridge Depression Trans Pers}
+set.seed(1)
+dep_t_pers_ridge_cv <- cv.glmnet(dep_t_pred_pers, dep_trans_2, alpha = 0)
+dep_t_pers_ridge_bestlam <- dep_t_pers_ridge_cv$lambda.min
+dep_t_pers_ridge_bestlam
+
+dep_t_pers_ridge <- glmnet(dep_t_pred_pers, dep_trans_2, alpha = 0,
+                       lambda = dep_t_pers_ridge_bestlam)
+coef(dep_t_pers_ridge)
+# Biggest: emotional stability
+# Smallest: agreeableness
+
+set.seed(1)
+dep_t_pers_2_ridge_cv <- cv.glmnet(dep_t_pred_pers_2, dep_trans, alpha = 0)
+dep_t_pers_2_ridge_bestlam <- dep_t_pers_2_ridge_cv$lambda.min
+dep_t_pers_2_ridge_bestlam
+
+dep_t_pers_2_ridge <- glmnet(dep_t_pred_pers_2, dep_trans, alpha = 0,
+                       lambda = dep_t_pers_2_ridge_bestlam)
+coef(dep_t_pers_2_ridge)
+# Biggest: TIPI4, TIPI9
+# Smallest: TIPI2, TIPI3, TIPI5, TIPI7, TIPI10
+```
+
+#### Lasso
+
+```{r Lasso Depression Pers}
+set.seed(1)
+dep_pers_lasso_cv <- cv.glmnet(dep_pred_pers, dep_score_2, alpha = 1)
+dep_pers_lasso_bestlam <- dep_pers_lasso_cv$lambda.min
+dep_pers_lasso_bestlam
+
+dep_pers_lasso <- glmnet(dep_pred_pers, dep_score_2, alpha = 1,
+                       lambda = dep_pers_lasso_bestlam)
+coef(dep_pers_lasso)
+# Biggest: emotional stability, maybe extraversion
+# Smallest: agreeableness
+
+set.seed(1)
+dep_pers_2_lasso_cv <- cv.glmnet(dep_pred_pers_2, dep_score, alpha = 1)
+dep_pers_2_lasso_bestlam <- dep_pers_2_lasso_cv$lambda.min
+dep_pers_2_lasso_bestlam
+
+dep_pers_2_lasso <- glmnet(dep_pred_pers_2, dep_score, alpha = 1,
+                       lambda = dep_pers_2_lasso_bestlam)
+coef(dep_pers_2_lasso)
+# Biggest: TIPI4, TIPI9, maybe TIPI1 and 6
+# Smallest: TIPI2, TIPI5, TIPI7, TIPI10
+```
+
+```{r Lasso Depression Trans Pers}
+set.seed(1)
+dep_t_pers_lasso_cv <- cv.glmnet(dep_t_pred_pers, dep_trans_2, alpha = 1)
+dep_t_pers_lasso_bestlam <- dep_t_pers_lasso_cv$lambda.min
+dep_t_pers_lasso_bestlam
+
+dep_t_pers_lasso <- glmnet(dep_t_pred_pers, dep_trans_2, alpha = 1,
+                       lambda = dep_t_pers_lasso_bestlam)
+coef(dep_t_pers_lasso)
+# Biggest: emotional stability
+# Smallest: agreeableness
+
+set.seed(1)
+dep_t_pers_2_lasso_cv <- cv.glmnet(dep_t_pred_pers_2, dep_trans, alpha = 1)
+dep_t_pers_2_lasso_bestlam <- dep_t_pers_2_lasso_cv$lambda.min
+dep_t_pers_2_lasso_bestlam
+
+dep_t_pers_2_lasso <- glmnet(dep_t_pred_pers_2, dep_trans, alpha = 1,
+                       lambda = dep_t_pers_2_lasso_bestlam)
+coef(dep_t_pers_2_lasso)
+# Biggest: TIPI4, TIPI9
+# Smallest: TIPI2, TIPI3, TIPI5, TIPI7, TIPI10
+```
+
+## Best Variables
+
+### Stress
+
+#### Own Scale
+
+Ridge, untransformed: Q1A, Q11A, Q39A
+
+Ridge, transformed: Q11A, Q29A
+
+Lasso, untransformed: Q1A, Q11A, Q27A
+
+Lasso, transformed: Q11A, Q27A, Q29A
+
+#### Other Scales
+
+Ridge, untransformed: Q9A, Q13A, Q28A, Q30A
+
+Ridge, transformed: Q9A, Q13A, Q28A
+
+Lasso, untransformed: Q9A, Q13A, Q28A, Q30A
+
+Lasso, transformed: Q9A, Q13A, Q28A
+
+#### Demographics
+
+Ridge, untransformed: education, orientation, race, gender, marriage
+
+Ridge, transformed: education, orientation, race, gender, marriage, country
+
+Lasso, untransformed: education, orientation, race, gender, marriage
+
+Lasso, transformed: education, orientation, race, gender, marriage
+
+#### Personality
+
+All the same: emotional stability. Specifically, TIPI4 and then TIPI9 (which is always smaller).
+
+### Anxiety
+
+#### Own Scale
+
+Ridge, untransformed: Q7A, Q23A
+
+Ridge, transformed: Q9A, Q40A
+
+Lasso, untransformed: Q4A, Q7A, Q28A
+
+Lasso, transformed: Q2A, Q9A, Q40A
+
+#### Other Scales
+
+All the same: Q12A, Q33A
+
+#### Demographics
+
+All the same: education, orientation, race, gender, marriage
+
+#### Personality
+
+All the same: emotional stability, specifically TIPI4 and TIPI9. TIPI5 also showing some promise.
+
+### Depression
+
+#### Own Scale
+
+Ridge, untransformed: Q3A, Q13A
+
+Ridge, transformed: Q13A, Q17A
+
+Lasso, untransformed: Q10A, Q13A, Q21A
+
+Lasso, transformed:  Q13A, Q17A
+
+#### Other Scales
+
+Ridge, untransformed: Q8A, Q11A, Q22A, Q27A, Q36A
+
+Ridge, transformed: Q8A, Q11A, Q27A
+
+Lasso, untransformed: Q8A, Q11A, Q22A, Q27A, Q36A
+
+Lasso, transformed: Q8A, Q11A
+
+#### Demographics
+
+Ridge, untransformed: education, orientation, race, gender, marriage, country
+
+Ridge, transformed: education, orientation, gender, marriage, country
+
+Lasso, untransformed: education, orientation, race, gender, marriage, country
+
+Lasso, transformed: education, orientation, gender, marriage
+
+#### Personality
+
+All the same: emotional stability (TIPI4, TIPI9); some emphasis on extraversion (TIPI1, TIPI6)
+
+### Aggregate
+
+Q9A, Q11A, Q13A, Q27A, Q28A, emotional stability (TIPI4, TIPI9)
+
+Note: this cannot be enough, but this is a good subset of variables that are important to at least two, maybe three models! Seven questions is a good start - maybe adding 1-2 more each per scale will give us a simple, effective diagnostic.
+
+
+# Trees
+
+## Stress
+
+```{r Tree Stress Pred}
+stress_preds <- trainData %>% 
+  select((starts_with("Q") & ends_with("A")), starts_with("TIPI"), education,
+         urban, gender, age, religion, orientation, race, voted, married,
+         familysize, stress_score)
+stress_preds[sapply(stress_preds, is.character)] <-
+  lapply(stress_preds[sapply(stress_preds, is.character)], as.factor)
+stress_t_preds <- trainData %>% 
+  select((starts_with("Q") & ends_with("A")), starts_with("TIPI"), education,
+         urban, gender, age, religion, orientation, race, voted, married,
+         familysize, stress_trans)
+stress_t_preds[sapply(stress_t_preds, is.character)] <-
+  lapply(stress_t_preds[sapply(stress_t_preds, is.character)], as.factor)
+```
+
+### Bagging
+
+```{r Tree Stress Bag}
+#set.seed(1)
+#stress_bag <- randomForest(stress_score ~ ., stress_preds, mtry = 62,
+                           #importance = T, ntree = 500)
+#save(stress_bag, file = "Stress Bag.RData")
+importance(stress_bag)
+varImpPlot(stress_bag)
+```
+
+```{r Tree Stress Bag Trans}
+#set.seed(1)
+#stress_t_bag <- randomForest(stress_trans ~ ., stress_t_preds, mtry = 62,
+                           #importance = T, ntree = 500)
+#save(stress_t_bag, file = "Stress Trans Bag.RData")
+importance(stress_t_bag)
+varImpPlot(stress_t_bag)
+```
+
+
+### Random Forest
+
+```{r Tree Stress RF}
+#set.seed(1)
+#stress_rf <- randomForest(stress_score ~ ., stress_preds, mtry = 8,
+                          #importance = T, ntree = 500)
+#save(stress_rf, file = "Stress RF.RData")
+importance(stress_rf)
+varImpPlot(stress_rf)
+```
+
+```{r Tree Stress RF Trans}
+#set.seed(1)
+#stress_t_rf <- randomForest(stress_trans ~ ., stress_t_preds, mtry = 8,
+                          #importance = T, ntree = 500)
+#save(stress_t_rf, file = "Stress Trans RF.RData")
+importance(stress_t_rf)
+varImpPlot(stress_t_rf)
+```
+
+### Boosting
+
+```{r Tree Stress Boost}
+#set.seed(1)
+#stress_boost <- gbm(stress_score ~ ., stress_preds, distribution = "gaussian",
+                    #n.trees = 5000, interaction.depth = 1)
+#save(stress_boost, file = "Stress Boost.RData")
+summary(stress_boost)
+
+#set.seed(1)
+#stress_boost_int <- gbm(stress_score ~ ., stress_preds,
+                        #distribution = "gaussian", n.trees = 5000,
+                        #interaction.depth = 5)
+#save(stress_boost_int, file = "Stress Boost Int.RData")
+summary(stress_boost_int)
+```
+
+```{r Tree Stress Trans Boost}
+#set.seed(1)
+#stress_t_boost <- gbm(stress_trans ~ ., stress_t_preds,
+                      #distribution = "gaussian",
+                    #n.trees = 5000, interaction.depth = 1)
+#save(stress_t_boost, file = "Stress Trans Boost.RData")
+summary(stress_t_boost)
+
+#set.seed(1)
+#stress_t_boost_int <- gbm(stress_trans ~ ., stress_t_preds,
+                        #distribution = "gaussian", n.trees = 5000,
+                        #interaction.depth = 5)
+#save(stress_t_boost_int, file = "Stress Trans Boost Int.RData")
+summary(stress_t_boost_int)
+```
+
+
+## Anxiety
+
+```{r Tree Anx Pred}
+anx_preds <- trainData %>% 
+  select((starts_with("Q") & ends_with("A")), starts_with("TIPI"), education,
+         urban, gender, age, religion, orientation, race, voted, married,
+         familysize, anxiety_score)
+anx_preds[sapply(anx_preds, is.character)] <-
+  lapply(anx_preds[sapply(anx_preds, is.character)], as.factor)
+anx_t_preds <- trainData %>% 
+  select((starts_with("Q") & ends_with("A")), starts_with("TIPI"), education,
+         urban, gender, age, religion, orientation, race, voted, married,
+         familysize, anxiety_trans)
+anx_t_preds[sapply(anx_t_preds, is.character)] <-
+  lapply(anx_t_preds[sapply(anx_t_preds, is.character)], as.factor)
+```
+
+### Bagging
+
+```{r Tree Anx Bag}
+#set.seed(1)
+#anx_bag <- randomForest(anxiety_score ~ ., anx_preds, mtry = 62,
+                           #importance = T, ntree = 500)
+#save(anx_bag, file = "Anxiety Bag.RData")
+importance(anx_bag)
+varImpPlot(anx_bag)
+```
+
+```{r Tree Anx Bag Trans}
+#set.seed(1)
+#anx_t_bag <- randomForest(anxiety_trans ~ ., anx_t_preds, mtry = 62,
+                           #importance = T, ntree = 500)
+#save(anx_t_bag, file = "Anxiety Trans Bag.RData")
+importance(anx_t_bag)
+varImpPlot(anx_t_bag)
+```
+
+
+### Random Forest
+
+```{r Tree Anxiety RF}
+#set.seed(1)
+#anx_rf <- randomForest(anxiety_score ~ ., anx_preds, mtry = 8,
+                          #importance = T, ntree = 500)
+#save(anx_rf, file = "Anxiety RF.RData")
+importance(anx_rf)
+varImpPlot(anx_rf)
+```
+
+```{r Tree Anxiety RF Trans}
+#set.seed(1)
+#anx_t_rf <- randomForest(anxiety_trans ~ ., anx_t_preds, mtry = 8,
+                          #importance = T, ntree = 500)
+#save(anx_t_rf, file = "Anxiety Trans RF.RData")
+importance(anx_t_rf)
+varImpPlot(anx_t_rf)
+```
+
+### Boosting
+
+```{r Tree Anxiety Boost}
+#set.seed(1)
+#anx_boost <- gbm(anxiety_score ~ ., anx_preds, distribution = "gaussian",
+                    #n.trees = 5000, interaction.depth = 1)
+#save(anx_boost, file = "Anxiety Boost.RData")
+summary(anx_boost)
+
+#set.seed(1)
+#anx_boost_int <- gbm(anxiety_score ~ ., anx_preds,
+                        #distribution = "gaussian", n.trees = 5000,
+                        #interaction.depth = 5)
+#save(anx_boost_int, file = "Anxiety Boost Int.RData")
+summary(anx_boost_int)
+```
+
+```{r Tree Anxiety Trans Boost}
+#set.seed(1)
+#anx_t_boost <- gbm(anxiety_trans ~ ., anx_t_preds,
+                      #distribution = "gaussian",
+                    #n.trees = 5000, interaction.depth = 1)
+#save(anx_t_boost, file = "Anxiety Trans Boost.RData")
+summary(anx_t_boost)
+
+#set.seed(1)
+#anx_t_boost_int <- gbm(anxiety_trans ~ ., anx_t_preds,
+                        #distribution = "gaussian", n.trees = 5000,
+                        #interaction.depth = 5)
+#save(anx_t_boost_int, file = "Anxiety Trans Boost Int.RData")
+summary(anx_t_boost_int)
+```
+
+## Depression
+
+```{r Tree Dep Pred}
+dep_preds <- trainData %>% 
+  select((starts_with("Q") & ends_with("A")), starts_with("TIPI"), education,
+         urban, gender, age, religion, orientation, race, voted, married,
+         familysize, depression_score)
+dep_preds[sapply(dep_preds, is.character)] <-
+  lapply(dep_preds[sapply(dep_preds, is.character)], as.factor)
+dep_t_preds <- trainData %>% 
+  select((starts_with("Q") & ends_with("A")), starts_with("TIPI"), education,
+         urban, gender, age, religion, orientation, race, voted, married,
+         familysize, depression_trans)
+dep_t_preds[sapply(dep_t_preds, is.character)] <-
+  lapply(dep_t_preds[sapply(dep_t_preds, is.character)], as.factor)
+```
+
+### Bagging
+
+```{r Tree Dep Bag}
+#set.seed(1)
+#dep_bag <- randomForest(depression_score ~ ., dep_preds, mtry = 62,
+                           #importance = T, ntree = 500)
+#save(dep_bag, file = "Depression Bag.RData")
+importance(dep_bag)
+varImpPlot(dep_bag)
+```
+
+```{r Tree Dep Bag Trans}
+#set.seed(1)
+#dep_t_bag <- randomForest(depression_trans ~ ., dep_t_preds, mtry = 62,
+                           #importance = T, ntree = 500)
+#save(dep_t_bag, file = "Depression Trans Bag.RData")
+importance(dep_t_bag)
+varImpPlot(dep_t_bag)
+```
+
+
+### Random Forest
+
+```{r Tree Dep RF}
+#set.seed(1)
+#dep_rf <- randomForest(depression_score ~ .,dep_preds, mtry = 8,
+                          #importance = T, ntree = 500)
+#save(dep_rf, file = "Depression RF.RData")
+importance(dep_rf)
+varImpPlot(dep_rf)
+```
+
+```{r Tree Dep RF Trans}
+#set.seed(1)
+#dep_t_rf <- randomForest(depression_trans ~ ., dep_t_preds, mtry = 8,
+                          #importance = T, ntree = 500)
+#save(dep_t_rf, file = "Depression Trans RF.RData")
+importance(dep_t_rf)
+varImpPlot(dep_t_rf)
+```
+
+### Boosting
+
+```{r Tree Dep Boost}
+#set.seed(1)
+#dep_boost <- gbm(depression_score ~ ., dep_preds, distribution = "gaussian",
+                    #n.trees = 5000, interaction.depth = 1)
+#save(dep_boost, file = "Depression Boost.RData")
+summary(dep_boost)
+
+#set.seed(1)
+#dep_boost_int <- gbm(depression_score ~ ., dep_preds,
+                        #distribution = "gaussian", n.trees = 5000,
+                        #interaction.depth = 5)
+#save(dep_boost_int, file = "Depression Boost Int.RData")
+summary(dep_boost_int)
+```
+
+```{r Tree Dep Trans Boost}
+#set.seed(1)
+#dep_t_boost <- gbm(depression_trans ~ ., dep_t_preds,
+                      #distribution = "gaussian",
+                    #n.trees = 5000, interaction.depth = 1)
+#save(dep_t_boost, file = "Depression Trans Boost.RData")
+summary(dep_t_boost)
+
+#set.seed(1)
+#dep_t_boost_int <- gbm(depression_trans ~ ., dep_t_preds,
+                        #distribution = "gaussian", n.trees = 5000,
+                        #interaction.depth = 5)
+#save(dep_t_boost_int, file = "Depression Trans Boost Int.RData")
+summary(dep_t_boost_int)
+```
+
+## Best Variables
+
+### Stress
+
+#### Bag
+
+Untransformed, own scale: Q11A, Q22A, Q27A
+
+Untransformed, other scales: TIPI4, Q9A, Q28A, Q13A, Q40A, Q36A, Q20A
+
+Transformed, own scale: Q11A, Q22A, Q27A
+
+Transformed, other scales: Q9A, Q13A, TIPI9, Q28A, TIPI4, Q30A, Q40A, Q36A
+
+#### RF
+
+Untransformed, own scale: Q14A, Q23A, Q35A, Q18A (note: the IncNodePurity measure gave completely different answers; in this case, they were Q11A, Q1A, Q29A, Q27A)
+
+Untransformed, other scales: Q40A, Q30A, TIPI4, Q10A, Q16A, TIPI9, Q9A
+
+Transformed, own scale: Q14A, Q25A, Q32A (other measure: Q11A, Q1A, Q29A, Q39A)
+
+Transformed, other scales: Q40A, Q30A, TIPI9, Q28A, Q10A, Q4A, Q25A
+
+#### Boost
+
+Untransformed, own scale: Q11A, Q27A, Q29A, Q1A
+
+Untransformed, other scales: religion, orientation, age, familysize, education, TIPI6 (weird)
+
+Transformed, own scale: Q11A, Q27A, Q29A, Q1A
+
+Transformed, other scales: religion, age, orientation, familysize, TIPI10
+
+I'm getting the sense the boosting models will not be helpful here (keeping in mind I never cross-validated)
+
+
+### Anxiety
+
+#### Bag
+
+Untransformed, own scale: Q28A, Q7A, Q40A
+
+Untransformed, other scales: TIPI4, Q13A, TIPI9, Q29A, Q12A, Q33A
+
+Transformed, own scale: Q2A, Q25A, Q19A, Q30A (note: by other measure, it is the same vars as untransformed)
+
+Transformed, other scales: TIPI9, TIPI3, Q12A, TIPI4, TIPI5, Q13A, Q33A
+
+#### RF
+
+Untransformed, own scale: Q2A, Q19A, Q40A, Q25A (other measure: Q28A, Q7A, Q20A)
+
+Untransformed, other scales: Q16A, Q31A, Q21A, Q38A, Q12A, Q35A
+
+Transformed, own scale: Q2A, Q25A, Q19A (other measure: Q7A, Q28A, Q40A, Q9A)
+
+Transformed, other scales: Q38A, Q32A, Q10A, Q27A, Q12A, Q5A
+
+#### Boost
+
+Untransformed, own scale: Q28A, Q7A, Q36A, Q20A
+
+Untransformed, other scales: religion, orientation, age, education, race, familysize
+
+Transformed, own scale: Q28A, Q7A, Q9A, Q40A
+
+Transformed, other scales: religion, age, Q13A, Q33A, TIPI4, Q11A
+
+
+### Depression
+
+#### Bag
+
+Untransformed, own scale: Q10A, Q21A, Q13A
+
+Untransformed, other scales: TIPI9, TIPI5, TIPI3, TIPI1, Q29A, TIPI7, Q22A, TIPI4
+
+Transformed, own scale: Q10A, Q5A, Q24A, Q13A (other measure: Q24A, Q21A, Q10A)
+
+Transformed, other scales: TIPI9, TIPI4, TIPI5, TIPI1
+
+#### RF
+
+Untransformed, own scale: Q42A, Q31A, Q5A (other measure: Q21A, Q28A, Q10A, Q34A)
+
+Untransformed, other scales: Q11A, Q30A, Q8A, Q22A, Q29A, Q36A
+
+Transformed, own scale: Q42A, Q5A, Q31A (other measure: Q34A, Q21A, Q38A)
+
+Transformed, other scales: Q35A, Q22A, Q20A, Q11A, Q6A, Q39A
+
+#### Boost
+
+Untransformed, own scale: Q21A, Q38A, Q34A, Q10A, Q13A
+
+Untransformed, other scales: religion, age, orientation, Q20A, Q11A, TIPI5
+
+Transformed, own scale: Q21A, Q34A, Q10A, Q13A
+
+Transformed, other scales: religion, age, orientation, Q20A, Q11A, TIPI5
+
+
+### Aggregate
+
+Stress: Q11A, Q27A, Q29A (Q22A, Q1A)
+
+Anxiety: Q20A, Q28A, Q40A (Q7A, Q9A)
+
+Depression: Q10A, Q13A, Q21A (Q34A, Q38A)
+
+Other scales: TIPI4 (not sure TIPI9 is strictly necessary)
+
+
+# Best Overall
+
+## Stress
+
+Linear Models: Q1A, Q11A
+
+Ridge, untransformed: Q1A, Q11A, Q39A
+
+Ridge, transformed: Q11A, Q29A
+
+Lasso, untransformed: Q1A, Q11A, Q27A
+
+Lasso, transformed: Q11A, Q27A, Q29A
+
+Trees: Q11A, Q27A, Q29A (Q22A, Q1A)
+
+**Answer:** Q11A, Q27A, Q29A (do I want Q1A? Probably not necessary, but add if the model isn't modeling)
+
+## Anxiety
+
+Linear Models: 23A, 7A, 28A, 8A
+
+Ridge, untransformed: Q7A, Q23A
+
+Ridge, transformed: Q9A, Q40A
+
+Lasso, untransformed: Q4A, Q7A, Q28A
+
+Lasso, transformed: Q2A, Q9A, Q40A
+
+Trees: Q20A, Q28A, Q40A (Q7A, Q9A)
+
+**Answer:** Q9A, Q28A, Q40A
+
+## Depression
+
+Linear Models: Q3A, Q13A
+
+Ridge, untransformed: Q3A, Q13A
+
+Ridge, transformed: Q13A, Q17A
+
+Lasso, untransformed: Q10A, Q13A, Q21A
+
+Lasso, transformed:  Q13A, Q17A
+
+Trees: Q10A, Q13A, Q21A (Q34A, Q38A)
+
+**Answer:** Q10A, Q13A, Q21A (could try Q3A if the model isn't modeling).
+
+## Other Scales
+
+TIPI4 (could use TIPI9, but I don't think it's necessary)
+
+# Final Answer
+
+Q11A, Q27A, Q29A
+
+Q9A, Q28A, Q40A
+
+Q10A, Q13A, Q21A
+
+TIPI4
+
+```{r Exploring Selected Variables}
+trainData %>% 
+  select(Q11A, Q27A, Q29A, Q9A, Q28A, Q40A, Q10A, Q13A, Q21A, TIPI4) %>% 
+  ggpairs() +
+  theme_bw()
+```
+

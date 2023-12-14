@@ -1,0 +1,924 @@
+---
+title: "Model Evaluation"
+author: "Dav King"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+# Setup
+
+## Libraries and Data
+
+```{r Libraries and Data}
+library(MASS)
+library(tidyverse)
+library(tidymodels)
+library(readr)
+library(GGally)
+library(corrplot)
+library(glmnet)
+library(tree)
+library(randomForest)
+library(gbm)
+library(splines)
+library(class)
+library(FNN)
+library(e1071)
+library(viridis)
+
+grid <- 10^seq(10, -2, length = 100)
+data <- read_delim("data.csv", delim = "\t", 
+                   escape_double = FALSE, trim_ws = TRUE)
+test_thr <- seq(.5, .7, by = .01)
+```
+
+## Data Transformations
+
+```{r DT Creating Scales}
+data <- data %>% 
+  mutate(stress_score = Q1A + Q6A + Q8A + Q11A + Q12A + Q14A + Q18A + 
+           Q22A + Q27A + Q29A + Q32A + Q33A + Q35A + Q39A,
+         anxiety_score = Q2A + Q4A + Q7A + Q9A + Q15A + Q19A + Q20A +
+           Q23A + Q25A + Q28A + Q30A + Q36A + Q40A + Q41A,
+         depression_score = Q3A + Q5A + Q10A + Q13A + Q16A + Q17A + Q21A + 
+           Q24A + Q26A + Q31A + Q34A + Q37A + Q38A + Q42A) %>% 
+  mutate(stress_score_reduced = Q1A + Q6A + Q8A + Q12A + Q14A + Q18A + Q22A + 
+           Q32A + Q33A + Q35A + Q39A,
+         anxiety_score_reduced = Q2A + Q4A + Q7A + Q15A + Q19A + Q20A + Q23A +
+           Q25A + Q30A + Q36A + Q41A,
+         depression_score_reduced = Q3A + Q5A + Q16A + Q17A + Q24A + Q26A +
+           Q31A + Q34A + Q37A + Q38A + Q42A) %>% 
+  mutate(stress_score = stress_score - 14, # Original responses are based on 0-3 scale
+         anxiety_score = anxiety_score - 14, # Dataset is based on 1-4 scale
+         depression_score = depression_score - 14) %>% # 14 questions per scale
+  mutate(stress_score_reduced = stress_score_reduced - 11,
+         anxiety_score_reduced = anxiety_score_reduced - 11, # Same idea here
+         depression_score_reduced = depression_score_reduced - 11) %>% 
+  mutate(anxiety_trans = sqrt(anxiety_score),
+         anxiety_trans_reduced = sqrt(anxiety_score_reduced)) %>% 
+  mutate(stress_cat = case_when(
+    stress_score <= 14 ~ "Normal",
+    stress_score <= 18 ~ "Mild",
+    stress_score <= 25 ~ "Moderate",
+    stress_score <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ), anxiety_cat = case_when(
+    anxiety_score <= 7 ~ "Normal",
+    anxiety_score <= 9 ~ "Mild",
+    anxiety_score <= 14 ~ "Moderate",
+    anxiety_score <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ), depression_cat = case_when(
+    depression_score <= 9 ~ "Normal",
+    depression_score <= 13 ~ "Mild",
+    depression_score <= 20 ~ "Moderate",
+    depression_score <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(stress_cat = factor(stress_cat,
+                             levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")),
+         anxiety_cat = factor(anxiety_cat,
+                              levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")),
+         depression_cat = factor(depression_cat,
+                                 levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>%
+  mutate(stress_bin = factor(if_else(stress_score > 18, "High", "Low")),
+         anxiety_bin = factor(if_else(anxiety_score > 9, "High", "Low")),
+         depression_bin = factor(if_else(depression_score > 13, "High", "Low"))) %>% 
+  mutate(TIPI4 = if_else(TIPI4 == 0, NA, TIPI4)) %>% 
+  mutate(TIPI4 = if_else(is.na(TIPI4), 4, TIPI4)) # Justification: A) this is a very small subset of the data, and it allows us to use this data instead of it being missing, B) TIPI4 is already our weakest predictor anyway, and C) "neither agree nor disagree" seems to be a reasonable, neutral midpoint to impute
+
+data %>% 
+  select(stress_bin) %>% 
+  group_by(stress_bin) %>% 
+  count()
+
+data %>% 
+  select(anxiety_bin) %>% 
+  group_by(anxiety_bin) %>% 
+  count()
+
+data %>% 
+  select(depression_bin) %>% 
+  group_by(depression_bin) %>% 
+  count()
+
+big_countries <- c("MY", "US", "GB", "CA", "ID", "PH", "AU", "NONE")
+
+data <- data %>% 
+  mutate(country_simp = if_else(country %in% big_countries, country, "Other"))
+
+data <- data %>% 
+  mutate(education = case_when(
+    education == 1 ~ "Less than high school",
+    education == 2 ~ "High school",
+    education == 3 ~ "University degree",
+    education == 4 ~ "Graduate degree",
+    T ~ "Unknown"
+  )) %>% 
+  mutate(education = factor(education,
+                            levels = c("Unknown", "Less than high school",
+                                       "High school", "University degree",
+                                       "Graduate degree")))
+
+data <- data %>% 
+  mutate(race = case_when(
+    race == 10 ~ "Asian",
+    race == 20 ~ "Arab",
+    race == 30 ~ "Black", 
+    race == 40 ~ "Indigenous Australian",
+    race == 50 ~ "Native American",
+    race == 60 ~ "White",
+    race == 70 ~ "Other",
+    T ~ "Unknown"
+  ))
+
+data <- data %>% 
+  mutate(gender = case_when(
+    gender == 1 ~ "Male",
+    gender == 2 ~ "Female",
+    gender == 3 ~ "Other",
+    T ~ "Unknown"
+  ))
+```
+
+## Splitting Data
+
+```{r Data Splits}
+set.seed(322)
+split <- initial_split(data, prop = .75)
+trainData <- training(split)
+testData <- testing(split)
+training_folds <- vfold_cv(trainData, v = 10)
+```
+
+## Selecting Predictor Subset
+
+```{r Final Predictors}
+trainSubset <- trainData %>% 
+  select(stress_score, stress_bin, anxiety_score, anxiety_trans,
+         anxiety_trans_reduced, anxiety_bin, depression_score, depression_bin,
+         stress_score_reduced, anxiety_score_reduced, depression_score_reduced,
+         Q11A, Q27A, Q29A, Q9A, Q28A, Q40A, Q10A, Q13A, Q21A, TIPI4)
+```
+
+## Loading Models
+
+```{r Loading Models}
+load("Stress Regression Model.RData")
+load("Stress Reduced Regression Model.RData")
+load("Stress Classification Model.RData")
+load("Anxiety Regression Model.RData")
+load("Anxiety Reduced Regression Model.RData")
+load("Anxiety Classification Model.RData")
+load("Depression Regression Model.RData")
+load("Depression Reduced Regression Model.RData")
+load("Depression Classification Model.RData")
+```
+
+# Stress
+
+## Prediction + MSE
+
+```{r Stress Prediction}
+stress_preds <- predict(stress_final_reg, testData)
+stress_MSE <- mean((stress_preds - testData$stress_score)^2) # 14.339
+
+str_truth_pred <- data.frame(stress_preds, testData$stress_score)
+
+stress_pred_cat <- data.frame(stress_preds) %>% 
+  mutate(stress_preds = case_when(
+    stress_preds <= 14 ~ "Normal",
+    stress_preds <= 18 ~ "Mild",
+    stress_preds <= 25 ~ "Moderate",
+    stress_preds <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(stress_preds = factor(stress_preds, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")))
+
+chisq.test(testData$stress_cat, stress_pred_cat$stress_preds)
+# Sig, but I guess almost anything is with 10,000 data points
+
+set.seed(325)
+chisq.test(testData$stress_cat, stress_pred_cat$stress_preds,
+           simulate.p.value = T, B = 5000)
+# Less significant but still highly significant
+
+
+stress_preds_red <- predict(stress_final_reg_red, testData)
+stress_MSE_red <- mean((stress_preds_red - testData$stress_score_reduced)^2) # 14.339
+
+str_truth_pred_red <- data.frame(stress_preds_red, testData$stress_score_reduced)
+```
+
+## Data Visualizations
+
+```{r Stress Visualizations}
+str_truth_pred %>% 
+  rename(Empirical = testData.stress_score, Predicted = stress_preds) %>% 
+  pivot_longer(everything()) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(color = "white", bins = length(unique(testData$stress_score))) +
+  facet_wrap(~ name) +
+  theme_bw() +
+  labs(x = "Stress Score", y = "Number of Observations",
+       title = "How Well Did We Predict Stress?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Definitely seems like we predicted higher values than we might expect
+# Also, of course, we have some predictions that fall outside of the true range
+
+str_truth_pred %>% 
+  rename(Empirical = testData.stress_score, Predicted = stress_preds) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  theme_bw() +
+  labs(x = "Stress Score", y = "Density",
+       title = "How Well Did We Predict Stress?") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis(discrete = T)
+# Looks like we predicted a little more mass towards the center, and then also slightly higher values in general (except for the extreme)
+
+str_truth_pred %>% 
+  rename(Empirical = testData.stress_score, Predicted = stress_preds) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(value = case_when(
+    value <= 14 ~ "Normal",
+    value <= 18 ~ "Mild",
+    value <= 25 ~ "Moderate",
+    value <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_bar(position = "dodge") +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Stress Category", y = "Number of Observations", 
+       title = "How Well Did We Predict Stress?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Honestly, pretty good - we predicted a bit low on Normal and Mild, and a bit high on Moderate and Severe, but that's our goal anyway :)
+
+```
+
+```{r Stress Reduced Visualizations}
+str_truth_pred_red %>% 
+  rename(Empirical = testData.stress_score_reduced,
+         Predicted = stress_preds_red) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  theme_bw() +
+  labs(x = "Stress Score", y = "Density",
+       title = "How Well Did We Predict (Reduced) Stress?") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis(discrete = T)
+# Very similar to before, but maybe our model is a little more centered now
+
+
+str_truth_pred_red %>% 
+  rename(Empirical = testData.stress_score_reduced,
+         Predicted = stress_preds_red) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(value = case_when(
+    value <= 14 * (11 / 14) ~ "Normal",
+    value <= 18 * (11 / 14) ~ "Mild",
+    value <= 25 * (11 / 14) ~ "Moderate",
+    value <= 33 * (11 / 14) ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_bar(position = "dodge") +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Stress Category", y = "Number of Observations", 
+       title = "How Well Did We Predict (Reduced) Stress?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# I mean, definitely less pretty. Undershot Normal by a bit, overshot Moderate and Severe by a good bit, undershot extremely severe by a lot
+```
+
+## Classification Power
+
+```{r Stress Classification}
+stress_class_probs <- predict(stress_final_class, testData, type = "response")
+stress_class_preds <- rep("Low", length(stress_class_probs))
+stress_class_preds[stress_class_probs < .63] <- "High"
+stress_class_mce <- mean(stress_class_preds != testData$stress_bin) # 10.549%
+stress_class_fn <- mean(stress_class_preds == "Low" &
+                          testData$stress_bin == "High") # 3.208%
+table(stress_class_preds, testData$stress_bin)
+
+stress_reg_class_preds <- if_else(stress_preds > 17.5, "High", "Low")
+table(stress_reg_class_preds, testData$stress_bin) # Fewer false negatives and false positives
+stress_reg_mce <- mean(stress_reg_class_preds != testData$stress_bin) # 10.499
+```
+
+There is no reason to have the separate classification model - this model performs better classification.
+
+
+# Anxiety
+
+## Prediction + MSE
+
+```{r Anxiety Prediction}
+anx_preds <- predict(anx_final_reg, testData)
+anx_MSE <- mean((anx_preds - testData$anxiety_trans)^2) # 0.389
+anx_MSE_regular <- mean((anx_preds^2 - testData$anxiety_score)^2) # 21.634
+
+anx_truth_pred <- data.frame(anx_preds, testData$anxiety_trans)
+
+anx_pred_cat <- data.frame(anx_preds) %>% 
+  mutate(anx_preds = case_when(
+    anx_preds^2 <= 7 ~ "Normal",
+    anx_preds^2 <= 9 ~ "Mild",
+    anx_preds^2 <= 14 ~ "Moderate",
+    anx_preds^2 <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(anx_preds = factor(anx_preds, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")))
+
+chisq.test(testData$anxiety_cat, anx_pred_cat$anx_preds)
+# Sig, but I guess almost anything is with 10,000 data points
+
+set.seed(325)
+chisq.test(testData$anxiety_cat, anx_pred_cat$anx_preds,
+           simulate.p.value = T, B = 5000)
+# Less significant but still highly significant
+
+
+anx_preds_red <- predict(anx_final_reg_red, testData)
+anx_MSE_red <- mean((anx_preds_red - testData$anxiety_trans_reduced)^2) # 0.564
+anx_MSE_red_regular <- mean((anx_preds_red^2 - testData$anxiety_score_reduced)^2) # 21.674
+
+anx_truth_pred_red <- data.frame(anx_preds_red, testData$anxiety_trans_reduced)
+```
+
+## Data Visualizations
+
+```{r Anxiety Visualizations}
+anx_truth_pred %>% 
+  rename(Empirical = testData.anxiety_trans, Predicted = anx_preds) %>% 
+  pivot_longer(everything()) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(color = "white", bins = 15) +
+  facet_wrap(~ name) +
+  theme_bw() +
+  labs(x = "Anxiety Score (Transformed)", y = "Number of Observations",
+       title = "How Well Did We Predict Anxiety?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Definitely seems like we predicted right skew
+
+anx_truth_pred %>% 
+  rename(Empirical = testData.anxiety_trans, Predicted = anx_preds) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  theme_bw() +
+  labs(x = "Anxiety Score (Transformed)", y = "Density",
+       title = "How Well Did We Predict Anxiety?") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis(discrete = T)
+# Looks like we predicted a little more mass towards the center, and then also slightly higher values in general (except for the extreme). The mass is leaning towards the right (but then, so is the empirical distribution to an extent).
+
+anx_truth_pred %>% 
+  rename(Empirical = testData.anxiety_trans, Predicted = anx_preds) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(value = case_when(
+    value^2 <= 7 ~ "Normal",
+    value^2 <= 9 ~ "Mild",
+    value^2 <= 14 ~ "Moderate",
+    value^2 <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_bar(position = "dodge") +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Anxiety Category", y = "Number of Observations", 
+       title = "How Well Did We Predict Anxiety?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Honestly, pretty good - definitely missed on Mild, undershot Extremely Severe and overshot Severe but if all we're concerned about is screening, that distinction doesn't matter
+
+```
+
+```{r Anxiety Reduced Visualizations}
+anx_truth_pred_red %>% 
+  rename(Empirical = testData.anxiety_trans_reduced,
+         Predicted = anx_preds_red) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  theme_bw() +
+  labs(x = "Anxiety Score (Transformed)", y = "Density",
+       title = "How Well Did We Predict (Reduced) Anxiety?") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis(discrete = T)
+# Very similar to before, but maybe our model is a little more centered now. We are definitely missing a lot of mass at the extremes (this is arguably a flaw in the data as is)
+
+
+anx_truth_pred_red %>% 
+  rename(Empirical = testData.anxiety_trans_reduced,
+         Predicted = anx_preds_red) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(value = case_when(
+    value^2 <= 7 * (11 / 14) ~ "Normal",
+    value^2 <= 9 * (11 / 14) ~ "Mild",
+    value^2 <= 14 * (11 / 14) ~ "Moderate",
+    value^2 <= 19 * (11 / 14) ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_bar(position = "dodge") +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Anxiety Category", y = "Number of Observations", 
+       title = "How Well Did We Predict (Reduced) Anxiety?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Not too much worse - overshot Moderate & Severe, undershot the other three, generally what we wanted to do
+```
+
+## Classification Power
+
+```{r Anxiety Classification}
+anx_class_probs <- predict(anx_final_class, testData, type = "response")
+anx_class_preds <- rep("Low", length(anx_class_probs))
+anx_class_preds[anx_class_probs < .68] <- "High"
+anx_class_mce <- mean(anx_class_preds != testData$anxiety_bin) # 11.977%
+anx_class_fn <- mean(anx_class_preds == "Low" &
+                          testData$anxiety_bin == "High") # 2.655%
+table(anx_class_preds, testData$anxiety_bin)
+
+anx_reg_class_preds <- if_else(anx_preds^2 > 7.6, "High", "Low")
+table(anx_reg_class_preds, testData$anxiety_bin) # Almost identical
+anx_reg_mce <- mean(anx_reg_class_preds != testData$anxiety_bin) # 12.037
+```
+
+There is some, but minimal, reason to have a classification model - it does slightly outperform, but not really to the extent where I would say we can justify an entire new model.
+
+# Depression
+
+## Prediction + MSE
+
+```{r Dep Prediction}
+dep_preds <- predict(dep_final_reg, testData)
+dep_MSE <- mean((dep_preds - testData$depression_score)^2) # 14.310
+
+dep_truth_pred <- data.frame(dep_preds, testData$depression_score)
+
+dep_pred_cat <- data.frame(dep_preds) %>% 
+  mutate(dep_preds = case_when(
+    dep_preds <= 9 ~ "Normal",
+    dep_preds <= 13 ~ "Mild",
+    dep_preds <= 20 ~ "Moderate",
+    dep_preds <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(dep_preds = factor(dep_preds, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe")))
+
+chisq.test(testData$depression_cat, dep_pred_cat$dep_preds)
+# Sig, but I guess almost anything is with 10,000 data points
+
+set.seed(325)
+chisq.test(testData$depression_cat, dep_pred_cat$dep_preds,
+           simulate.p.value = T, B = 5000)
+# Less significant but still highly significant
+
+
+dep_preds_red <- predict(dep_final_reg_red, testData)
+dep_MSE_red <- mean((dep_preds_red - testData$depression_score_reduced)^2) # 14.310
+
+dep_truth_pred_red <- data.frame(dep_preds_red, testData$depression_score_reduced)
+```
+
+## Data Visualizations
+
+```{r Dep Visualizations}
+dep_truth_pred %>% 
+  rename(Empirical = testData.depression_score, Predicted = dep_preds) %>% 
+  pivot_longer(everything()) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(color = "white", bins = 15) +
+  facet_wrap(~ name) +
+  theme_bw() +
+  labs(x = "Depression Score", y = "Number of Observations",
+       title = "How Well Did We Predict Depression?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Definitely seems like we predicted higher values than we might expect
+# We actually predicted more extremes in this case
+
+dep_truth_pred %>% 
+  rename(Empirical = testData.depression_score, Predicted = dep_preds) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  theme_bw() +
+  labs(x = "Depression Score", y = "Density",
+       title = "How Well Did We Predict Depression?") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis(discrete = T)
+# Looks like we predicted slightly more high values, but overall this is pretty solid
+
+dep_truth_pred %>% 
+  rename(Empirical = testData.depression_score, Predicted = dep_preds) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(value = case_when(
+    value <= 9 ~ "Normal",
+    value <= 13 ~ "Mild",
+    value <= 20 ~ "Moderate",
+    value <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_bar(position = "dodge") +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Depression Category", y = "Number of Observations", 
+       title = "How Well Did We Predict Depression?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Honestly, pretty good - we undershot normal slightly, otherwise all-around almost perfect
+
+```
+
+```{r Dep Reduced Visualizations}
+dep_truth_pred_red %>% 
+  rename(Empirical = testData.depression_score_reduced,
+         Predicted = dep_preds_red) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  theme_bw() +
+  labs(x = "Depression Score", y = "Density",
+       title = "How Well Did We Predict (Reduced) Depression?") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis(discrete = T)
+# Very similar to before, but a little more chaotic
+
+
+dep_truth_pred_red %>% 
+  rename(Empirical = testData.depression_score_reduced,
+         Predicted = dep_preds_red) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(value = case_when(
+    value <= 9 * (11 / 14) ~ "Normal",
+    value <= 13 * (11 / 14) ~ "Mild",
+    value <= 20 * (11 / 14) ~ "Moderate",
+    value <= 27 * (11 / 14) ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_bar(position = "dodge") +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Depression Category", y = "Number of Observations", 
+       title = "How Well Did We Predict (Reduced) Depression?") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Better than the others! Undershot normal, almost entirely made up for it in moderate.
+```
+
+## Classification Power
+
+```{r Dep Classification}
+dep_class_probs <- predict(dep_final_class, testData, type = "response")
+dep_class_preds <- rep("Low", length(dep_class_probs))
+dep_class_preds[dep_class_probs < .81] <- "High"
+dep_class_mce <- mean(dep_class_preds != testData$depression_bin) # 9.694%
+dep_class_fn <- mean(dep_class_preds == "Low" &
+                          testData$depression_bin == "High") # 0.986%
+table(dep_class_preds, testData$depression_bin)
+
+dep_reg_class_preds <- if_else(dep_preds > 10.5, "High", "Low")
+table(dep_reg_class_preds, testData$depression_bin) # Close as we're gonna get
+dep_reg_mce <- mean(dep_reg_class_preds != testData$depression_bin) # 9.714%
+```
+
+There is minimal reason to have a separate classification model. This model can approximate the efficacy of the logistic regression model, close enough that we do not need to have two models.
+
+# Joint Data Visualizations
+
+```{r Density Plot}
+truth_pred <- data.frame(stress_preds, testData$stress_score,
+                         anx_preds, testData$anxiety_score,
+                         dep_preds, testData$depression_score)
+
+truth_pred %>% 
+  mutate(anx_preds = anx_preds^2) %>% 
+  rename("Stress Empirical" = testData.stress_score,
+         "Stress Predicted" = stress_preds,
+         "Anxiety Empirical" = testData.anxiety_score,
+         "Anxiety Predicted" = anx_preds,
+         "Depression Empirical" = testData.depression_score,
+         "Depression Predicted" = dep_preds) %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  separate(Distribution, into = c("Scale", "Distribution"), sep = " ") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ Scale) +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Predicted Value", y = "Density",
+       title = "How Well Did We Predict Depression, Anxiety, and Stress?") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+```
+
+```{r Density Plot w/ Highest Category}
+data %>% 
+  select(stress_score, anxiety_score, depression_score) %>% 
+  pivot_longer(everything(), names_to = "Scale") %>% 
+  mutate(Scale = case_when(
+    Scale == "stress_score" ~ "Stress",
+    Scale == "anxiety_score" ~ "Anxiety",
+    T ~ "Depression"
+  )) %>% 
+  mutate(max = if_else(value == 42, T, F)) %>% 
+  ggplot(aes(x = value, fill = Scale)) +
+  geom_histogram(color = "white", bins = 43) +
+  facet_wrap(~ Scale) +
+  theme_bw() +
+  scale_fill_viridis(discrete = T, option = "D") +
+  scale_fill_manual(values = c("Anxiety" = viridis_pal(option = "D")(1),
+                               "Depression" = viridis_pal(option = "D")(21),
+                               "Stress" = viridis_pal(option = "D")(41),
+                               max = "red")) +
+  labs(x = "Score", y = "Number of Observations", 
+       title = "Distributions of DASS Scores", caption = "Figure 2") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+```
+
+
+```{r Category Plot}
+truth_pred %>% 
+  mutate(anx_preds = anx_preds^2) %>% 
+  mutate("Stress Empirical" = case_when(
+    testData.stress_score <= 14 ~ "Normal",
+    testData.stress_score <= 18 ~ "Mild",
+    testData.stress_score <= 25 ~ "Moderate",
+    testData.stress_score <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Stress Predicted" = case_when(
+    stress_preds <= 14 ~ "Normal",
+    stress_preds <= 18 ~ "Mild",
+    stress_preds <= 25 ~ "Moderate",
+    stress_preds <= 33 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Anxiety Empirical" = case_when(
+    testData.anxiety_score <= 7 ~ "Normal",
+    testData.anxiety_score <= 9 ~ "Mild",
+    testData.anxiety_score <= 14 ~ "Moderate",
+    testData.anxiety_score <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Anxiety Predicted" = case_when(
+    anx_preds <= 7 ~ "Normal",
+    anx_preds <= 9 ~ "Mild",
+    anx_preds <= 14 ~ "Moderate",
+    anx_preds <= 19 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Depression Empirical" = case_when(
+    testData.depression_score <= 9 ~ "Normal",
+    testData.depression_score <= 13 ~ "Mild",
+    testData.depression_score <= 20 ~ "Moderate",
+    testData.depression_score <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  ),
+  "Depression Predicted" = case_when(
+    dep_preds <= 9 ~ "Normal",
+    dep_preds <= 13 ~ "Mild",
+    dep_preds <= 20 ~ "Moderate",
+    dep_preds <= 27 ~ "Severe",
+    T ~ "Extremely Severe"
+  )) %>% 
+  select("Stress Empirical", "Stress Predicted", "Anxiety Empirical",
+         "Anxiety Predicted", "Depression Empirical", "Depression Predicted") %>% 
+  pivot_longer(everything(), names_to = "Distribution") %>% 
+  mutate(value = factor(value, levels = c("Normal", "Mild", "Moderate",
+                                        "Severe", "Extremely Severe"))) %>%
+  separate(Distribution, into = c("Scale", "Distribution"), sep = " ") %>% 
+  ggplot(aes(x = value, fill = Distribution)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ Scale) +
+  theme_bw() +
+  scale_fill_viridis(discrete = T) +
+  labs(x = "Category", y = "Number of Observations",
+       title = "How Well Did We Classify Depression, Anxiety, and Stress?") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+# Residuals
+
+```{r Stress Residuals}
+stress_res <- stress_preds - testData$stress_score
+hist(stress_res)
+
+testData %>% 
+  cbind(stress_res) %>% 
+  ggplot(aes(x = stress_res, fill = country_simp)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ country_simp) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Stress Residuals", y = "Density",
+       title = "Distribution of Stress Residuals by Country") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Looks fine to me
+
+testData %>% 
+  cbind(stress_res) %>% 
+  filter(age < 150) %>% 
+  ggplot(aes(x = age, y = stress_res)) +
+  geom_point() +
+  geom_smooth() +
+  theme_bw() +
+  labs(x = "Age", y = "Residuals",
+       title = "Distribution of Stress Residuals by Age") +
+  theme(plot.title = element_text(hjust = 0.5))
+# No real trends at all - entirely centered around 0
+
+testData %>% 
+  cbind(stress_res) %>% 
+  ggplot(aes(x = stress_res, fill = education)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ education) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Stress Residuals", y = "Density",
+       title = "Distribution of Stress Residuals by Education Level") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Looks fine to me, although predictions appear to get slightly better at higher education levels
+
+testData %>% 
+  cbind(stress_res) %>% 
+  ggplot(aes(x = stress_res, fill = gender)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ gender) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Stress Residuals", y = "Density",
+       title = "Distribution of Stress Residuals by Gender") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# We seem to have slightly underpredicted stress for "other" and overpredicted (a minute amount) for men. Overall not too bad, but maybe room for future research with a stratified dataset?
+
+testData %>% 
+  cbind(stress_res) %>% 
+  ggplot(aes(x = stress_res, fill = race)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ race) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Stress Residuals", y = "Density",
+       title = "Distribution of Stress Residuals by Race") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Good enough
+```
+
+
+```{r Anxiety Residuals}
+anx_res <- anx_preds - testData$anxiety_trans
+hist(anx_res)
+
+testData %>% 
+  cbind(anx_res) %>% 
+  ggplot(aes(x = anx_res, fill = country_simp)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ country_simp) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Anxiety Residuals", y = "Density",
+       title = "Distribution of Anxiety Residuals by Country") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Pretty good 
+
+testData %>% 
+  cbind(anx_res) %>% 
+  filter(age < 150) %>% 
+  ggplot(aes(x = age, y = anx_res)) +
+  geom_point() +
+  geom_smooth() +
+  theme_bw() +
+  labs(x = "Age", y = "Residuals",
+       title = "Distribution of Anxiety Residuals by Age") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Residuals ever so slightly increase with age - we maybe slightly undershot anxiety for young people
+
+testData %>% 
+  cbind(anx_res) %>% 
+  ggplot(aes(x = anx_res, fill = education)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ education) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Anxiety Residuals", y = "Density",
+       title = "Distribution of Anxiety Residuals by Education Level") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Good as you can ask for
+
+testData %>% 
+  cbind(anx_res) %>% 
+  ggplot(aes(x = anx_res, fill = gender)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ gender) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Anxiety Residuals", y = "Density",
+       title = "Distribution of Anxiety Residuals by Gender") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Seems fine
+
+testData %>% 
+  cbind(anx_res) %>% 
+  ggplot(aes(x = anx_res, fill = race)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ race) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Anxiety Residuals", y = "Density",
+       title = "Distribution of Anxiety Residuals by Race") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Some definite messiness - would maybe run an analysis on this in the future
+```
+
+```{r Depression Residuals}
+dep_res <- dep_preds - testData$depression_score
+hist(dep_res)
+
+testData %>% 
+  cbind(dep_res) %>% 
+  ggplot(aes(x = dep_res, fill = country_simp)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ country_simp) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Depression Residuals", y = "Density",
+       title = "Distribution of Depression Residuals by Country") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Pretty good, but looks like we slightly undershot in western nations (Australia, Canada, GB, USA) and overshot Indonesia
+
+testData %>% 
+  cbind(dep_res) %>% 
+  filter(age < 150) %>% 
+  ggplot(aes(x = age, y = dep_res)) +
+  geom_point() +
+  geom_smooth() +
+  theme_bw() +
+  labs(x = "Age", y = "Residuals",
+       title = "Distribution of Depression Residuals by Age") +
+  theme(plot.title = element_text(hjust = 0.5))
+# If you squint hard enough you can maybe convince yourself of a linear trend
+
+testData %>% 
+  cbind(dep_res) %>% 
+  ggplot(aes(x = dep_res, fill = education)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ education) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Depression Residuals", y = "Density",
+       title = "Distribution of Depression Residuals by Education Level") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Pretty good, but slightly undershot "less than high school"
+
+testData %>% 
+  cbind(dep_res) %>% 
+  ggplot(aes(x = dep_res, fill = gender)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ gender) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Depression Residuals", y = "Density",
+       title = "Distribution of Depression Residuals by Gender") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Wildly undershot "other" and overshot "unknown"
+
+testData %>% 
+  cbind(dep_res) %>% 
+  ggplot(aes(x = dep_res, fill = race)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ race) +
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  labs(x = "Depression Residuals", y = "Density",
+       title = "Distribution of Depression Residuals by Race") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+# Not bad, but more precise in some populations than others
+```
+
