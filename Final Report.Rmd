@@ -455,6 +455,8 @@ However, there are some things that (if confirmed as valid) it would be able to 
 
 This tool also paves the way for similar research to follow. In this study, we have only scratched the surface of the potential for future research in this field. Even with this set of DASS responses, more could be explored. While response times for each question were not considered as a predictor, it is entirely possible that spending more time contemplating a question may be just as important of a predictor as the actual response to that question, especially if participants are unwilling to be truthful. Additionally, while the models seemed not to differ much by demographics, early results highlighted a few such domains to explore - gender for stress, race for anxiety, education for depression. DASS modeling would also benefit from being run on other, perhaps more valid data, and this tool might be validated with empirical testing on a controlled population. But we are far from limited to just the DASS. Any number of other diagnoses, including learning disabilities, could benefit heavily from the exact type of short screening tools that this approach may be able to develop. This tool, and others like it to follow, could revolutionize psychology by making psychometric testing and psychological diagnosis more accessible than ever before. This study is just the start - but if these findings are any indication at all, there is almost unfathomable untapped potential to explore in the domain of psychological statistics.
 
+*Note: for more information, including all scratch work, model files, and any future updates, visit https://github.com/davmking/abbreviated-DASS-scale/tree/master*
+
 
 \newpage
 
